@@ -4,7 +4,7 @@
   "description": "PTY wrapper for auto-pausing and resuming Claude Code when subscription quota resets.",
   "license": "MIT",
   "bin": {
-    "cc-autoresume": "bin/cc-autoresume.js"
+    "cc-autoresume": "bin/cc-autoresume"
   },
   "files": [
     "bin",

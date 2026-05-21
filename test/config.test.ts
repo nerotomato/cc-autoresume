@@ -30,6 +30,28 @@ describe('parseConfig', () => {
     expect(config.restoreMaxAgeHours).toBe(72);
   });
 
+  it('默认开启 session 跟踪、心跳兜底，菜单按键为空', () => {
+    const config = parseConfig([], {});
+    expect(config.disableSessionTracking).toBe(false);
+    expect(config.disableWakeHeartbeat).toBe(false);
+    expect(config.limitMenuKeys).toBe('');
+  });
+
+  it('CC_AUTORESUME_DISABLE_SESSION_TRACKING=1 关闭 session 跟踪', () => {
+    const config = parseConfig([], { CC_AUTORESUME_DISABLE_SESSION_TRACKING: '1' });
+    expect(config.disableSessionTracking).toBe(true);
+  });
+
+  it('CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT=1 关闭心跳兜底', () => {
+    const config = parseConfig([], { CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT: '1' });
+    expect(config.disableWakeHeartbeat).toBe(true);
+  });
+
+  it('CC_AUTORESUME_LIMIT_MENU_KEYS 配置菜单按键序列', () => {
+    const config = parseConfig([], { CC_AUTORESUME_LIMIT_MENU_KEYS: 'up,enter' });
+    expect(config.limitMenuKeys).toBe('up,enter');
+  });
+
   it('CC_AUTORESUME_ENABLE_API_POLL=1 时开启 API 轮询（opt-in）', () => {
     const config = parseConfig([], { CC_AUTORESUME_ENABLE_API_POLL: '1' });
     expect(config.disableApiPoll).toBe(false);

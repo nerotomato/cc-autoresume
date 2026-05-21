@@ -23,6 +23,9 @@ export interface Config {
   triggersFile: string;
   restoreMaxAgeHours: number;
   stateDir: string;             // 扫描 state-*.json 用的目录
+  disableSessionTracking: boolean;  // 关闭 wrapper 给 claude 注入 --session-id
+  disableWakeHeartbeat: boolean;    // 关闭 paused 期间的墙钟心跳兜底
+  limitMenuKeys: string;            // 撞墙菜单按键序列（如 "up,enter"），空 = 不操作菜单
 }
 
 const targetNames = new Set<TargetName>(['auto', 'claude', 'codex']);
@@ -54,6 +57,9 @@ export function parseConfig(argv = process.argv.slice(2), env: NodeJS.ProcessEnv
     disableApiPoll: resolveDisableApiPoll(env),
     triggersFile: expandHome(env.CC_AUTORESUME_TRIGGERS_FILE ?? '~/.cc-autoresume/triggers.json'),
     restoreMaxAgeHours: parseBoundedNumber(env.CC_AUTORESUME_RESTORE_MAX_AGE_HOURS, 24, 0.01, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_RESTORE_MAX_AGE_HOURS'),
+    disableSessionTracking: parseBoolean(env.CC_AUTORESUME_DISABLE_SESSION_TRACKING),
+    disableWakeHeartbeat: parseBoolean(env.CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT),
+    limitMenuKeys: env.CC_AUTORESUME_LIMIT_MENU_KEYS ?? '',
   };
 }
 

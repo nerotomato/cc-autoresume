@@ -14,6 +14,21 @@ describe('findLimitMatch', () => {
   it('只有错误上下文但无限额关键词时不触发', () => {
     expect(findLimitMatch('Error: connection refused', claudeTriggers)).toBeUndefined();
   });
+
+  it("识别真实样例：You've hit your session limit · resets 3:10pm (Asia/Shanghai)", () => {
+    const text = "You've hit your session limit · resets 3:10pm (Asia/Shanghai)";
+    const match = findLimitMatch(text, claudeTriggers);
+    expect(match).toBeDefined();
+    expect(match?.pattern.source).toContain('session');
+  });
+
+  it("识别 You've hit your usage limit 变体", () => {
+    expect(findLimitMatch("You've hit your usage limit", claudeTriggers)).toBeDefined();
+  });
+
+  it("识别 You've hit your 5-hour limit 变体（带连字符）", () => {
+    expect(findLimitMatch("You've hit your 5-hour limit", claudeTriggers)).toBeDefined();
+  });
 });
 
 describe('extractResetTime', () => {
@@ -37,6 +52,15 @@ describe('extractResetTime', () => {
 
   it('无匹配返回 undefined', () => {
     expect(extractResetTime('nothing here', claudeTriggers.resetExtractors, now)).toBeUndefined();
+  });
+
+  it('解析 "resets 3:10pm" 这种 resets 后直接跟时分的格式', () => {
+    // now = 2026-05-20T00:00:00Z = 北京时间 08:00；3:10pm 当天即 15:10 北京时间，相对 now 在未来
+    const ms = extractResetTime("You've hit your session limit · resets 3:10pm (Asia/Shanghai)", claudeTriggers.resetExtractors, now);
+    expect(ms).toBeDefined();
+    // 解析出的时间一定晚于 now，且早于 now + 24h
+    expect(ms!).toBeGreaterThan(now);
+    expect(ms!).toBeLessThan(now + 24 * 60 * 60 * 1000);
   });
 });
 

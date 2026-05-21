@@ -51,7 +51,7 @@ stdin, stdout, TTY resize, raw mode and signals are all passed through, so day-t
 - **screen-scanner** (`src/screen-scanner.ts`) — strips ANSI, maintains a rolling buffer, matches against the loaded trigger set, extracts reset times from error text, and runs a BUSY/IDLE state machine driven by spinner / cursor-hide markers.
 - **triggers** (`src/triggers/`) — built-in pattern tables for `claude`, `codex` and a generic Chinese fallback (DeepSeek / Qwen / Doubao / GLM). Optionally merged with `~/.cc-autoresume/triggers.json`.
 - **adapter** (`src/adapters/anthropic.ts`) — calls `https://api.anthropic.com/api/oauth/usage`. Used both for periodic polling and for one-shot reset-time fallback on screen triggers.
-- **scheduler** (`src/scheduler.ts`) — owns the wake timer; verifies once before waking; if verify fails, pushes the wake another `defaultWaitHours` (default 5h) instead of giving up.
+- **scheduler** (`src/scheduler.ts`) — owns the wake timer; verifies once before waking; if verify fails, pushes the wake another `defaultWaitHours` (default 5h) and retries indefinitely until usage drops.
 - **state-machine** (`src/state-machine.ts`) — picks wake time (text > API > default) and classifies pause vs. paused_long by `maxWaitHours`.
 
 ### When does the wrapper actually auto-resume?
@@ -108,6 +108,8 @@ If `claude` is not on your `PATH`, `cc-autoresume --target=claude` will fail wit
 ## 5. Installation
 
 ### Option A — install from the npm registry (recommended)
+
+> 🚧 The package is not yet published to npm. Once published, use the commands below.
 
 ```bash
 npm install -g cc-autoresume
@@ -173,6 +175,9 @@ cc-autoresume --target=claude -- "summarize this repo"
 | `CC_AUTORESUME_DISABLE_API_POLL` | — | Legacy alias kept for backward compatibility; `1` forces API polling off (the new default already does this) |
 | `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` | `24` | If a prior `state-*.json` has `paused_at` older than this and its PID is dead, delete it during startup cleanup |
 | `CC_AUTORESUME_TRIGGERS_FILE` | `~/.cc-autoresume/triggers.json` | Path to user-defined trigger pattern overrides |
+| `CC_AUTORESUME_DISABLE_SESSION_TRACKING` | — | Set to `1` to stop auto-injecting `--session-id` into `claude`. On by default, only applies when `target=claude` |
+| `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT` | — | Set to `1` to disable the wall-clock heartbeat during pauses. On by default (fixes `wake_at` being severely delayed after macOS lid-close suspend) |
+| `CC_AUTORESUME_LIMIT_MENU_KEYS` | — | Comma-separated key sequence to blind-send to `claude` after a rate-limit hit, e.g. `up,enter`. Empty by default (menu untouched). Only applies when `target=claude` |
 | `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` | — | OAuth token. Falls back to `~/.claude/.credentials.json` |
 
 ## 8. How to set the env vars
@@ -248,7 +253,12 @@ User patterns are **merged on top of** the built-in set (additive, not replaceme
 
 By default each wrapper writes its own state file: `~/.cc-autoresume/state-<pid>.json`. This lets multiple terminal tabs run `cc-autoresume` at the same time without overwriting each other's `auto_resume`, `wake_at`, target, or PID.
 
-If a wrapper is killed during a pause (manual exit, OS reboot, crash), the saved state is **not automatically resumed** on the next start. The state file does not contain the underlying Claude/Codex session id, so auto-attaching a new CLI with `-c` could resume the wrong conversation when multiple tabs existed. The safe behavior is to start fresh and let the user choose any CLI-level resume command explicitly.
+If a wrapper is killed during a pause (manual exit, OS reboot, crash), the saved state is **not automatically resumed** on the next start. The state file *does* now record the `session_id` the wrapper assigned to `claude` (see [11. Session ID management](#11-session-id-management)), but auto-attaching a fresh wrapper to a session the user may have already abandoned would do more harm than good — so this step is left to the user:
+
+```bash
+cat ~/.cc-autoresume/state-*.json | jq -r '.session_id'  # find the session
+claude --resume <session-id>                              # decide for yourself
+```
 
 Every startup still cleans the state directory: any `state-*.json` / legacy `state.json` whose PID is dead **and** whose `paused_at` is older than `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` is deleted directly. Files for live PIDs, dead-but-still-recent pauses, `log.jsonl`, and `triggers.json` are left untouched.
 
@@ -264,11 +274,60 @@ You can see cleanup on a given start by looking at the log:
 tail -f ~/.cc-autoresume/log.jsonl | jq 'select(.event == "state_swept")'
 ```
 
-## 11. Exiting
+## 11. Session ID management
+
+When `target=claude`, the wrapper **auto-generates a UUID** at startup and passes it to `claude` via `--session-id <uuid>`. `claude` then creates its session log at `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` using that exact UUID. The same UUID is written to `~/.cc-autoresume/state-<pid>.json` under `session_id`.
+
+Why this matters:
+
+- **Traceable**: after a pause, `cat state-*.json | jq .session_id` tells you exactly which local jsonl belongs to the wrapped session — no fishing in `claude /resume` pickers
+- **Unambiguous manual resume**: `claude --resume <session_id>` reattaches to the exact session the wrapper was managing, instead of relying on the "most recent" heuristic that `-c` uses (which gets it wrong with multiple concurrent tabs)
+
+When the wrapper **does not** inject `--session-id` (i.e. "user already expressed a session intent, hands off"):
+
+| User-supplied arg | Wrapper behavior |
+|---|---|
+| `--session-id <id>` | Tracks this id in state (semantic match, no duplicate injection) |
+| `-r <id>` / `--resume <id>` (with value) | Tracks this id in state |
+| `-r` / `--resume` (picker mode, no value) | Untracked — `session_id` left empty |
+| `-c` / `--continue` | Untracked — `session_id` left empty |
+| `--fork-session` / `--from-pr ...` | Untracked |
+| `target=codex` etc. | Feature skipped entirely |
+
+To turn the whole feature off: `CC_AUTORESUME_DISABLE_SESSION_TRACKING=1`. The wrapper falls back to never injecting any arg.
+
+## 12. Suspend/resume (lid close)
+
+When you close the lid (or Windows hibernates), both the wrapper and the `claude` child are `SIGSTOP`-ed by the OS. PIDs remain, memory is preserved, the PTY survives, local session files are untouched — **suspend is functionally safe**.
+
+There is one Node.js gotcha though: a single-shot `setTimeout` is backed by the monotonic clock, and that clock **freezes during suspend** on macOS. So the "5h wake timer scheduled at limit-hit time" does **not** fire immediately when you open the lid 5h later — it has to wait for the wrapper's on-screen time to accumulate another 5h, which can delay the wake by hours.
+
+The wrapper has a built-in **wall-clock heartbeat** to fix that: every 60s during a pause it compares `Date.now()` to `wake_at`; the moment wall-clock passes `wake_at` it fires the wake immediately and clears all timers (idempotently).
+
+- **Only runs during a pause**: created when a pause starts, torn down on wake or wrapper exit. Zero cost when not paused
+- **Negligible overhead**: one `Date.now()` comparison per 60s — nanosecond-level
+- **Worst-case wake latency: 60s** — regardless of how long you stayed asleep, the next heartbeat after resume picks it up
+- Opt out with `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT=1` if you only run online and care about every cycle
+
+## 13. Auto-selecting the rate-limit menu
+
+When Claude Code hits a quota, it shows an interactive menu with options like "wait" vs "upgrade". `CC_AUTORESUME_LIMIT_MENU_KEYS` lets the wrapper blind-send a key sequence to `claude` 500ms after a rate-limit hit is detected, so it can pick "wait" for you:
+
+```bash
+export CC_AUTORESUME_LIMIT_MENU_KEYS="up,up,enter"
+# or
+export CC_AUTORESUME_LIMIT_MENU_KEYS="enter"
+```
+
+Supported keys: `up` / `down` / `left` / `right` / `enter` / `esc` / `tab` / `space`. Comma-separated, case-insensitive, unknown keys are silently dropped.
+
+The default is empty — no keys are sent. Once you've caught a real limit menu and shared the exact text in an issue, we'll publish recommended sequences for your `claude` version.
+
+## 14. Exiting
 
 - A single `Ctrl+C` is forwarded to the wrapped CLI (acts as if you pressed it inside `claude`).
 - Two `Ctrl+C` within 300ms force-kill the wrapper and its child.
 
-## 12. License
+## 15. License
 
 [MIT](./LICENSE)

@@ -14,6 +14,8 @@ export type SchedulerEvent =
 export interface TimerApi {
   setTimeout(callback: () => void, ms: number): unknown;
   clearTimeout(id: unknown): void;
+  setInterval(callback: () => void, ms: number): unknown;
+  clearInterval(id: unknown): void;
   now(): number;
 }
 
@@ -28,6 +30,8 @@ export interface SchedulerOptions {
   timer?: TimerApi;
   defaultWaitMs?: number;     // verify 失败后顺延这么久重试，默认 5h
   disablePolling?: boolean;   // 关闭主动轮询（屏幕扫描单跑模式）；同时跳过唤醒前 verify
+  disableWakeHeartbeat?: boolean;  // 关闭 paused 期间的墙钟心跳兜底（用于关心开销的极端场景）
+  heartbeatIntervalMs?: number;    // 心跳间隔，默认 60s；测试可调小
 }
 
 export class Scheduler {
@@ -35,15 +39,20 @@ export class Scheduler {
   private pollTimer?: unknown;
   private wakeTimer?: unknown;
   private verifyTimer?: unknown;
+  private heartbeatTimer?: unknown;       // 墙钟心跳兜底（修 Mac 休眠后 setTimeout 延迟 fire 的问题）
+  private wakeAtMsCached?: number;        // 心跳回调里跟 Date.now() 比较的目标时间
+  private wakeFired = false;              // 幂等保护：setTimeout 和心跳任一先 fire 后另一个跳过
   private failureCount = 0;
   private verifyAttempt = 0;
   private skipVerifyForCurrentPause = false;
   private readonly timer: TimerApi;
   private readonly defaultWaitMs: number;
+  private readonly heartbeatIntervalMs: number;
 
   constructor(private readonly options: SchedulerOptions) {
     this.timer = options.timer ?? realTimer;
     this.defaultWaitMs = options.defaultWaitMs ?? 5 * 60 * 60 * 1000;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60_000;
   }
 
   start(): void {
@@ -145,15 +154,32 @@ export class Scheduler {
   private scheduleWake(wakeAtMs: number): void {
     this.clearWakeTimers();
     if (this.stopped) return;
+    this.wakeAtMsCached = wakeAtMs;
+    this.wakeFired = false;
+
     const delayMs = Math.max(0, wakeAtMs - this.timer.now());
-    this.wakeTimer = this.timer.setTimeout(() => {
-      if (this.options.disablePolling || this.skipVerifyForCurrentPause) {
-        // 屏幕扫描触发的暂停 / 主动关闭 API 轮询：跳过 verify，直接发唤醒事件
-        void this.emit({ type: 'wake-due' });
-        return;
-      }
-      void this.verifyBeforeWake();
-    }, delayMs);
+    this.wakeTimer = this.timer.setTimeout(() => this.fireWakeOnce(), delayMs);
+
+    // 墙钟心跳兜底：Node setTimeout 在 Mac 长时间休眠下会按"在线时间"算 delay，
+    // 导致 wake_at 晚 fire 数小时。心跳每 N 秒检查一次 Date.now()，超过 wake_at 就立刻 fire
+    if (!this.options.disableWakeHeartbeat) {
+      this.heartbeatTimer = this.timer.setInterval(() => {
+        if (this.wakeAtMsCached !== undefined && Date.now() >= this.wakeAtMsCached) {
+          this.fireWakeOnce();
+        }
+      }, this.heartbeatIntervalMs);
+    }
+  }
+
+  private fireWakeOnce(): void {
+    if (this.wakeFired || this.stopped) return;
+    this.wakeFired = true;
+    this.clearWakeTimers();  // 清掉 setTimeout / verifyTimer / heartbeatTimer
+    if (this.options.disablePolling || this.skipVerifyForCurrentPause) {
+      void this.emit({ type: 'wake-due' });
+      return;
+    }
+    void this.verifyBeforeWake();
   }
 
   private async verifyBeforeWake(): Promise<void> {
@@ -191,8 +217,11 @@ export class Scheduler {
   private clearWakeTimers(): void {
     if (this.wakeTimer !== undefined) this.timer.clearTimeout(this.wakeTimer);
     if (this.verifyTimer !== undefined) this.timer.clearTimeout(this.verifyTimer);
+    if (this.heartbeatTimer !== undefined) this.timer.clearInterval(this.heartbeatTimer);
     this.wakeTimer = undefined;
     this.verifyTimer = undefined;
+    this.heartbeatTimer = undefined;
+    this.wakeAtMsCached = undefined;
   }
 
   private async emit(event: SchedulerEvent): Promise<void> {
@@ -224,6 +253,12 @@ const realTimer: TimerApi = {
   },
   clearTimeout(id) {
     clearTimeout(id as NodeJS.Timeout);
+  },
+  setInterval(callback, ms) {
+    return setInterval(callback, ms);
+  },
+  clearInterval(id) {
+    clearInterval(id as NodeJS.Timeout);
   },
   now() {
     return Date.now();

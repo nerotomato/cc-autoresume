@@ -15,6 +15,8 @@ export interface PersistedState {
   error?: string;
   auto_resume: boolean;
   wake_source?: WakeSource;
+  // wrapper 跟踪的 claude session UUID。撞墙后查 state 文件能直接看到该 resume 哪个 session
+  session_id?: string;
 }
 
 export class StateStore {

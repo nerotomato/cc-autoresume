@@ -52,6 +52,26 @@ describe('StateStore', () => {
     await expect(store.load()).resolves.toEqual(state);
   });
 
+  it('保存带 session_id 的 state 能完整读回', async () => {
+    const store = new StateStore(await tempStatePath());
+    const stateWithSession: PersistedState = {
+      version: 2,
+      state: 'paused',
+      trigger: 'screen',
+      target: 'claude',
+      paused_at: '2026-05-21T10:00:00.000Z',
+      wake_at: '2026-05-21T15:00:00.000Z',
+      pid: 999,
+      auto_resume: true,
+      wake_source: 'text',
+      session_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    };
+
+    await store.save(stateWithSession);
+
+    await expect(store.load()).resolves.toEqual(stateWithSession);
+  });
+
   it('clear 会删除状态文件', async () => {
     const store = new StateStore(await tempStatePath());
     await store.save({ version: 2, state: 'idle', trigger: null, target: 'claude', auto_resume: false });

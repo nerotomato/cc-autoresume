@@ -51,7 +51,7 @@
 - **screen-scanner** (`src/screen-scanner.ts`)：剥离 ANSI、维护滑动缓冲、匹配关键词、抽取 reset 时间、并跑一个由 spinner / cursor-hide marker 驱动的 BUSY/IDLE 状态机。
 - **triggers** (`src/triggers/`)：`claude` / `codex` / 通用中文（DeepSeek / Qwen / Doubao / GLM）三套内置关键词表，可被 `~/.cc-autoresume/triggers.json` 追加扩展。
 - **adapter** (`src/adapters/anthropic.ts`)：调用 `https://api.anthropic.com/api/oauth/usage`，既用于周期性轮询，也作为屏幕触发时的 reset 时间兜底（一次性调用）。
-- **scheduler** (`src/scheduler.ts`)：管理唤醒定时器；唤醒前做一次校验，校验不通过就把唤醒时间再推 `defaultWaitHours`（默认 5h）继续等，不会再 5 次后放弃。
+- **scheduler** (`src/scheduler.ts`)：管理唤醒定时器；唤醒前做一次校验，校验不通过就把唤醒时间再推 `defaultWaitHours`（默认 5h），如此循环直到利用率降下来为止。
 - **state-machine** (`src/state-machine.ts`)：决定唤醒时间的优先级（文本抽取 → API → 默认值）、以及超过 `maxWaitHours` 的 `paused_long` 模式。
 
 ### 暂停后到底会不会自动恢复？
@@ -86,7 +86,7 @@
 
 ## 3. 输出物
 
-| 路径 | 作用 | 默认值 |
+| 路径 | 作用 | 覆盖 |
 |---|---|---|
 | `~/.cc-autoresume/state-<pid>.json` | 当前 wrapper 状态快照（`version: 2`），含 `trigger`（`5h`/`7d`/`both`/`screen`/`manual`）、`auto_resume` 标志、`wake_source`（`api`/`text`/`default`）、唤醒时间、PID 等 | `CC_AUTORESUME_STATE_PATH`（显式切回单文件模式） |
 | `~/.cc-autoresume/log.jsonl` | 行式 JSON 日志，记录每一次 `startup` / `snapshot` / `pause_due` / `screen_pause_due` / `wake_sent` / `wake_skipped_user_active` / `verify_pushed` 等事件 | `CC_AUTORESUME_LOG` |
@@ -108,6 +108,8 @@
 ## 5. 安装
 
 ### 方式 A：从 npm 市场安装（推荐）
+
+> 🚧 包尚未发布到 npm，发布后即可使用以下命令。
 
 ```bash
 # 全局安装
@@ -181,6 +183,9 @@ cc-autoresume --target=claude -- "总结一下当前仓库"
 | `CC_AUTORESUME_DISABLE_API_POLL` | — | 旧别名，向后兼容用；`1` 强制关闭 API 轮询（其实新默认已经关了） |
 | `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` | `24` | 启动清理时，PID 已死且 `paused_at` 超过这个小时数的 `state-*.json` 会被直接删除 |
 | `CC_AUTORESUME_TRIGGERS_FILE` | `~/.cc-autoresume/triggers.json` | 用户自定义关键词表路径 |
+| `CC_AUTORESUME_DISABLE_SESSION_TRACKING` | — | 设为 `1` 关闭"给 `claude` 自动注入 `--session-id`"。默认开启，仅 `target=claude` 时生效 |
+| `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT` | — | 设为 `1` 关闭暂停期间的墙钟心跳兜底。默认开启（修复 Mac 合盖唤醒后 `wake_at` 严重延迟的问题） |
+| `CC_AUTORESUME_LIMIT_MENU_KEYS` | — | 撞墙后向 `claude` 盲发的按键序列（用逗号分隔），如 `up,enter`。默认空（不操作菜单）。仅 `target=claude` 时生效 |
 | `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` | — | OAuth token，未配置时回退读取 `~/.claude/.credentials.json` |
 
 ## 8. 如何配置环境变量
@@ -262,7 +267,12 @@ env | grep CC_AUTORESUME
 
 默认情况下，每个 wrapper 都写自己的状态文件：`~/.cc-autoresume/state-<pid>.json`。这样多个终端 tab 同时用 `cc-autoresume` 包 Claude / Codex 时，不会互相覆盖 `auto_resume`、`wake_at`、目标 CLI 或 PID。
 
-如果 wrapper 在暂停期间被打断（手动退出、电脑重启、进程崩溃），下次启动**不会自动接管旧 state 恢复等待**。state 文件里没有底层 Claude/Codex 的 session id；多个 tab 存在时，自动给新 CLI 加 `-c` 可能续到错误的对话。安全做法是干净启动，由用户自己显式选择 CLI 层面的续会话命令。
+如果 wrapper 在暂停期间被打断（手动退出、电脑重启、进程崩溃），下次启动**不会自动接管旧 state 恢复等待**。虽然 state 文件里记录了 wrapper 给 claude 分配的 `session_id`（详见 [11. 会话 ID 管理](#11-会话-id-管理)），但自动给新 wrapper 续上旧会话可能续到用户已经放弃的对话——所以这一步留给用户主动决定：
+
+```bash
+cat ~/.cc-autoresume/state-*.json | jq -r '.session_id'  # 查出要续的 session
+claude --resume <session-id>                              # 自己选要不要续
+```
 
 每次启动还会顺手清理状态目录：凡是 `state-*.json` / 老格式 `state.json` 里记录的 PID 已死，且 `paused_at` 超过 `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` 的文件，都会被直接删除。PID 还活着的文件、PID 已死但还在最大等待时间内的文件、`log.jsonl`、`triggers.json` 都不会动。
 
@@ -278,11 +288,60 @@ rm ~/.cc-autoresume/state-*.json ~/.cc-autoresume/state.json 2>/dev/null
 tail -f ~/.cc-autoresume/log.jsonl | jq 'select(.event == "state_swept")'
 ```
 
-## 11. 退出与中断
+## 11. 会话 ID 管理
+
+`target=claude` 时，wrapper 启动会**自动生成一个 UUID**，并以 `--session-id <uuid>` 的方式注入给 `claude` 子进程。`claude` 会按这个 UUID 在 `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` 创建会话文件。同一个 UUID 也被写进 `~/.cc-autoresume/state-<pid>.json` 的 `session_id` 字段。
+
+这样能解决什么问题：
+
+- **可追踪**：撞墙后 `cat state-*.json | jq .session_id` 直接看到当前会话对应哪个本地 jsonl，避免在 `claude /resume` picker 里找半天
+- **手动续会话精确无歧义**：`claude --resume <session_id>` 续的是 wrapper 实际管的那个会话，不依赖"最近一次"启发式（多 tab 并发场景下 `-c` 会续到错的）
+
+什么情况下 wrapper **不**会注入 `--session-id`（即"用户已经表达过 session 意图，wrapper 不插手"）：
+
+| 用户传的参数 | wrapper 行为 |
+|---|---|
+| `--session-id <id>` | 沿用此 ID 做 state 跟踪（语义一致，不重复注入） |
+| `-r <id>` / `--resume <id>`（带值） | 沿用此 ID 做 state 跟踪 |
+| `-r` / `--resume`（picker 模式，无值） | 不跟踪，`session_id` 字段留空 |
+| `-c` / `--continue` | 不跟踪，`session_id` 字段留空 |
+| `--fork-session` / `--from-pr ...` | 不跟踪 |
+| `target=codex` 等其它 CLI | 整个特性跳过 |
+
+完全关闭这个特性：`CC_AUTORESUME_DISABLE_SESSION_TRACKING=1`，wrapper 会回到不注入任何参数的旧行为。
+
+## 12. 休眠场景说明（合盖再开盖）
+
+Mac 合盖 / Windows 休眠期间，wrapper 与 `claude` 子进程都会被系统 `SIGSTOP`，进程 PID 还在、内存状态保留、PTY 不丢、本地 session 文件不受影响——所以**休眠对功能是安全的**。
+
+但有一个 Node.js 的坑：单发 `setTimeout` 底层用 monotonic 时钟，系统休眠时这个时钟会**暂停**。也就是说"撞墙时挂的 5h 定时器"在合盖 5h 后开盖时**并不会立刻 fire**，而是要等 wrapper "在线时间"补满 5h——可能导致唤醒晚数小时。
+
+wrapper 内置了一个**墙钟心跳兜底**来修这个：暂停期间每 60s 比较一次 `Date.now()` 和 `wake_at`，墙钟过了就立刻触发唤醒，并清掉所有定时器（幂等）。
+
+- **只在暂停期间运行**：撞墙后才创建，唤醒触发或 wrapper 退出后立即清掉，非暂停时段完全不跑
+- **开销可忽略**：每 60s 一次 `Date.now()` 比较，纳秒级
+- **唤醒最大延迟 60s**：合盖时间多长都没关系，开盖后下一次心跳触发就续上
+- 极端怕开销时可以 `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT=1` 关掉（仅在线场景下使用）
+
+## 13. 撞墙菜单自动选择
+
+Claude Code 撞墙时会弹一个交互菜单让用户选"暂停等待"或"升级套餐"。`CC_AUTORESUME_LIMIT_MENU_KEYS` 可以配置 wrapper 在识别到限额错误 500ms 后**盲发**给 `claude` 的方向键序列，自动帮你选"暂停等待"：
+
+```bash
+export CC_AUTORESUME_LIMIT_MENU_KEYS="up,up,enter"
+# 或
+export CC_AUTORESUME_LIMIT_MENU_KEYS="enter"
+```
+
+支持的键名：`up` / `down` / `left` / `right` / `enter` / `esc` / `tab` / `space`。逗号分隔，大小写不敏感，未知键名静默跳过。
+
+默认值为空 = 不发送任何按键。等你撞一次真实限额、把菜单文本贴到 issue 后，我们会给你的 claude 版本推荐稳定的默认序列。
+
+## 14. 退出与中断
 
 - 单次 `Ctrl+C`：被透传给目标 CLI（等价于在 CLI 里按 Ctrl+C）；
 - 300ms 内连续两次 `Ctrl+C`：强制结束 wrapper 与子 CLI。
 
-## 12. 许可证
+## 15. 许可证
 
 [MIT](./LICENSE)

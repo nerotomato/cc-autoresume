@@ -16,7 +16,8 @@ import { classifyPause, decideScreenWakeAt } from './state-machine';
 import { createScreenScanner, type ScreenScanResult, type ScreenScanner } from './screen-scanner';
 import { loadTriggerSet } from './triggers';
 import type { TargetCommand } from './target';
-import { sendWakeSequence } from './wake-keys';
+import { parseKeySequenceSteps, sendKeySequence, sendWakeSequence } from './wake-keys';
+import { decideSession } from './session-id';
 import { getLatestKnownResetMs, isSubscriptionSnapshot, type UsageAdapter } from './adapters/types';
 
 const RECENT_BUSY_WINDOW_MS = 5000;
@@ -39,7 +40,17 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     await logger.log('state_swept', { count: sweptPaths.length, paths: sweptPaths });
   }
 
-  const child = pty.spawn(target.command, target.args, {
+  // 仅 claude target 启用 session 跟踪：spawn 前算出 UUID + 注入参数
+  let sessionId: string | undefined;
+  let spawnArgs = target.args;
+  if (target.name === 'claude' && !config.disableSessionTracking) {
+    const decision = decideSession({ args: target.args });
+    sessionId = decision.sessionId;
+    spawnArgs = decision.injectedArgs;
+    await logger.log('session_decided', { source: decision.source, sessionId });
+  }
+
+  const child = pty.spawn(target.command, spawnArgs, {
     name: process.env.TERM || 'xterm-256color',
     cols: process.stdout.columns || 80,
     rows: process.stdout.rows || 24,
@@ -52,6 +63,7 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     command: target.command,
     pid: child.pid,
     adapter: adapter.id,
+    sessionId,
   });
 
   let context!: SchedulerContext;
@@ -82,6 +94,7 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
   context = {
     config, target, adapter, stateStore, logger, child, scheduler, scanner,
     paused: false,
+    sessionId,
   };
 
   return new Promise((resolve) => {
@@ -167,6 +180,7 @@ interface SchedulerContext {
   scheduler: Scheduler;
   scanner?: ScreenScanner;
   paused: boolean;
+  sessionId?: string;
 }
 
 function isBusyOrRecentlyBusy(scanner: ScreenScanner | undefined): boolean {
@@ -210,10 +224,22 @@ async function handleScreenLimitHit(result: ScreenScanResult, context: Scheduler
     pid: child.pid,
     auto_resume: true,
     wake_source: decision.source,
+    session_id: context.sessionId,
   };
   await stateStore.save(state);
   printBanner(formatScreenPauseBanner(result.matchedPattern, wakeAt, decision.source));
-  await logger.log('screen_pause_due', { matched: result.matchedPattern, wakeAt, source: decision.source, mode });
+  await logger.log('screen_pause_due', { matched: result.matchedPattern, wakeAt, source: decision.source, mode, sessionId: context.sessionId });
+
+  // 撞墙时如果用户配置了菜单按键序列，盲发让 claude 自动选"暂停等待"
+  // 等 500ms 让 claude 把菜单画完，再发键
+  if (target.name === 'claude' && config.limitMenuKeys && config.limitMenuKeys.length > 0) {
+    const steps = parseKeySequenceSteps(config.limitMenuKeys);
+    if (steps.length > 0) {
+      setTimeout(() => {
+        void sendKeySequence(child, steps).then(() => logger.log('menu_keys_sent', { keys: config.limitMenuKeys }));
+      }, 500);
+    }
+  }
 
   if (mode === 'paused') scheduler.pauseUntil(wakeAt, { skipVerify: true });
 }
@@ -250,6 +276,7 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
       pid: child.pid,
       auto_resume: autoResume,
       wake_source: 'api',
+      session_id: context.sessionId,
     };
     await stateStore.save(state);
 
@@ -296,6 +323,7 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
       wake_at: new Date().toISOString(),
       pid: child.pid,
       auto_resume: true,
+      session_id: context.sessionId,
     });
     await sendWakeSequence(child, { target: target.name, resumeHint: config.resumeHint });
     await stateStore.clear();

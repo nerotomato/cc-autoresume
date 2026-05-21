@@ -5,6 +5,8 @@ import type { UsageAdapter } from '../src/adapters/types';
 const timer = {
   setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
   clearTimeout: (id: unknown) => clearTimeout(id as NodeJS.Timeout),
+  setInterval: (callback: () => void, ms: number) => setInterval(callback, ms),
+  clearInterval: (id: unknown) => clearInterval(id as NodeJS.Timeout),
   now: () => Date.now(),
 };
 
@@ -175,6 +177,134 @@ describe('Scheduler', () => {
     // disablePolling 下到点直接发 wake-due，不调 verify
     expect(events.some((e) => e.type === 'wake-due')).toBe(true);
     expect(adapter.fetch).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('墙钟心跳兜底：setTimeout 没 fire 但 Date.now() 已过 wake_at 时触发 wake-due', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T00:00:00.000Z'));
+
+    // 关键：用一个 timer 让 setTimeout 永远不 fire（模拟 Mac 休眠下 monotonic clock 暂停）
+    // 但 setInterval 正常跑（心跳）
+    // 时间过去后 Date.now() 已经超过 wake_at，心跳应识别并 fire
+    const stuckTimer = {
+      setTimeout: (_cb: () => void, _ms: number) => 'stuck-timer-id',  // 不真正 schedule
+      clearTimeout: () => {},
+      setInterval: (callback: () => void, ms: number) => setInterval(callback, ms),
+      clearInterval: (id: unknown) => clearInterval(id as NodeJS.Timeout),
+      now: () => Date.now(),
+    };
+
+    const adapter: UsageAdapter = {
+      id: 'mock-test',
+      kind: 'mock',
+      matches: () => true,
+      fetch: vi.fn(),
+    };
+    const events: SchedulerEvent[] = [];
+    const scheduler = new Scheduler({
+      adapter,
+      env: {},
+      threshold: 99,
+      maxWaitHours: 12,
+      balanceWarn: 5,
+      wakeBufferMs: 0,
+      disablePolling: true,
+      heartbeatIntervalMs: 1000,
+      onEvent: (e) => { events.push(e); },
+      timer: stuckTimer,
+    });
+
+    scheduler.start();
+    scheduler.pauseUntil(new Date(Date.now() + 5000).toISOString(), { skipVerify: true });
+
+    // setTimeout 不会 fire（被 stuckTimer 吃了），但时间真的过了 wake_at
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect(events.some((e) => e.type === 'wake-due')).toBe(true);
+    scheduler.stop();
+  });
+
+  it('幂等 fire：setTimeout 先 fire 后心跳不再 fire 第二次', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T00:00:00.000Z'));
+
+    const adapter: UsageAdapter = {
+      id: 'mock-test',
+      kind: 'mock',
+      matches: () => true,
+      fetch: vi.fn(),
+    };
+    const events: SchedulerEvent[] = [];
+    const scheduler = new Scheduler({
+      adapter,
+      env: {},
+      threshold: 99,
+      maxWaitHours: 12,
+      balanceWarn: 5,
+      wakeBufferMs: 0,
+      disablePolling: true,
+      heartbeatIntervalMs: 1000,
+      onEvent: (e) => { events.push(e); },
+      timer,
+    });
+
+    scheduler.start();
+    scheduler.pauseUntil(new Date(Date.now() + 500).toISOString(), { skipVerify: true });
+    await vi.advanceTimersByTimeAsync(3000);  // setTimeout 先 fire，心跳后续也会 tick
+
+    const wakeEvents = events.filter((e) => e.type === 'wake-due');
+    expect(wakeEvents).toHaveLength(1);
+    scheduler.stop();
+  });
+
+  it('disableWakeHeartbeat=true 时不启动心跳（setTimeout 不 fire 时 wake-due 不会触发）', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T00:00:00.000Z'));
+
+    const stuckTimer = {
+      setTimeout: (_cb: () => void, _ms: number) => 'stuck-timer-id',
+      clearTimeout: () => {},
+      setInterval: (_cb: () => void, _ms: number) => 'stuck-interval-id',
+      clearInterval: () => {},
+      now: () => Date.now(),
+    };
+    let intervalCreated = false;
+    const trackingTimer = {
+      ...stuckTimer,
+      setInterval: (cb: () => void, ms: number) => {
+        intervalCreated = true;
+        return stuckTimer.setInterval(cb, ms);
+      },
+    };
+
+    const adapter: UsageAdapter = {
+      id: 'mock-test',
+      kind: 'mock',
+      matches: () => true,
+      fetch: vi.fn(),
+    };
+    const events: SchedulerEvent[] = [];
+    const scheduler = new Scheduler({
+      adapter,
+      env: {},
+      threshold: 99,
+      maxWaitHours: 12,
+      balanceWarn: 5,
+      wakeBufferMs: 0,
+      disablePolling: true,
+      disableWakeHeartbeat: true,
+      heartbeatIntervalMs: 1000,
+      onEvent: (e) => { events.push(e); },
+      timer: trackingTimer,
+    });
+
+    scheduler.start();
+    scheduler.pauseUntil(new Date(Date.now() + 500).toISOString(), { skipVerify: true });
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(intervalCreated).toBe(false);
+    expect(events.some((e) => e.type === 'wake-due')).toBe(false);
     scheduler.stop();
   });
 
