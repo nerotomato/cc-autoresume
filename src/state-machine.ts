@@ -1,7 +1,13 @@
 import type { SubscriptionUsageSnapshot } from './adapters/types';
 
 export type RuntimeStateName = 'idle' | 'running' | 'paused' | 'paused_long' | 'waking' | 'error';
-export type PauseTrigger = '5h' | '7d' | 'both' | 'screen' | null;
+export type PauseTrigger = '5h' | '7d' | 'both' | 'screen' | 'manual' | null;
+export type WakeSource = 'text' | 'api' | 'default';
+
+export interface ScreenWakeDecision {
+  wakeAtMs: number;
+  source: WakeSource;
+}
 
 export interface RuntimeState {
   state: RuntimeStateName;
@@ -16,7 +22,7 @@ export interface RuntimeState {
 }
 
 export interface WakeDecision {
-  trigger: Exclude<PauseTrigger, 'screen' | null>;
+  trigger: Exclude<PauseTrigger, 'screen' | 'manual' | null>;
   resetsAt: string;
   wakeAtMs: number;
 }
@@ -64,6 +70,25 @@ export function decideWakeAt(
 export function classifyPause(wakeAtMs: number, nowMs: number, maxWaitHours: number): 'paused' | 'paused_long' {
   const maxWaitMs = maxWaitHours * 60 * 60 * 1000;
   return wakeAtMs - nowMs > maxWaitMs ? 'paused_long' : 'paused';
+}
+
+export function decideScreenWakeAt(
+  extractedResetMs: number | undefined,
+  apiResetMs: number | undefined,
+  defaultWaitMs: number,
+  nowMs: number,
+  wakeBufferMs = 30_000,
+): ScreenWakeDecision {
+  // 优先用 CLI 文本里抽到的时间
+  if (extractedResetMs !== undefined && Number.isFinite(extractedResetMs) && extractedResetMs > nowMs) {
+    return { wakeAtMs: extractedResetMs + wakeBufferMs, source: 'text' };
+  }
+  // 次选 API 兜底
+  if (apiResetMs !== undefined && Number.isFinite(apiResetMs) && apiResetMs > nowMs) {
+    return { wakeAtMs: apiResetMs + wakeBufferMs, source: 'api' };
+  }
+  // 兜底默认值
+  return { wakeAtMs: nowMs + defaultWaitMs, source: 'default' };
 }
 
 export function shouldWakeAfterVerify(snapshot: SubscriptionUsageSnapshot, threshold: number): boolean {

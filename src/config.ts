@@ -17,6 +17,12 @@ export interface Config {
   testMode: boolean;
   wakeBufferMs: number;
   targetCommandOverride?: string;
+  defaultWaitHours: number;
+  disableScreenScan: boolean;
+  disableApiPoll: boolean;
+  triggersFile: string;
+  restoreMaxAgeHours: number;
+  stateDir: string;             // 扫描 state-*.json 用的目录
 }
 
 const targetNames = new Set<TargetName>(['auto', 'claude', 'codex']);
@@ -34,7 +40,8 @@ export function parseConfig(argv = process.argv.slice(2), env: NodeJS.ProcessEnv
     maxWaitHours: parseBoundedNumber(env.CC_AUTORESUME_MAX_WAIT_HOURS, 12, Number.MIN_VALUE, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_MAX_WAIT_HOURS'),
     balanceWarn: parseBoundedNumber(env.CC_AUTORESUME_BALANCE_WARN, 5, 0, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_BALANCE_WARN'),
     logPath: expandHome(env.CC_AUTORESUME_LOG ?? '~/.cc-autoresume/log.jsonl'),
-    statePath: expandHome(env.CC_AUTORESUME_STATE_PATH ?? '~/.cc-autoresume/state.json'),
+    statePath: expandHome(env.CC_AUTORESUME_STATE_PATH ?? `~/.cc-autoresume/state-${process.pid}.json`),
+    stateDir: expandHome('~/.cc-autoresume'),
     resumeHint: env.CC_AUTORESUME_RESUME_HINT ?? '继续',
     adapter: parseAdapterPreference(env.CC_AUTORESUME_ADAPTER ?? 'auto'),
     testMode,
@@ -42,7 +49,27 @@ export function parseConfig(argv = process.argv.slice(2), env: NodeJS.ProcessEnv
       ? parseBoundedNumber(env.CC_AUTORESUME_WAKE_BUFFER_MS, 30_000, 0, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_WAKE_BUFFER_MS')
       : 30_000,
     targetCommandOverride: testMode ? env.CC_AUTORESUME_TARGET_COMMAND : undefined,
+    defaultWaitHours: parseBoundedNumber(env.CC_AUTORESUME_DEFAULT_WAIT_HOURS, 5, 0.01, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_DEFAULT_WAIT_HOURS'),
+    disableScreenScan: parseBoolean(env.CC_AUTORESUME_DISABLE_SCREEN_SCAN),
+    disableApiPoll: resolveDisableApiPoll(env),
+    triggersFile: expandHome(env.CC_AUTORESUME_TRIGGERS_FILE ?? '~/.cc-autoresume/triggers.json'),
+    restoreMaxAgeHours: parseBoundedNumber(env.CC_AUTORESUME_RESTORE_MAX_AGE_HOURS, 24, 0.01, Number.POSITIVE_INFINITY, 'CC_AUTORESUME_RESTORE_MAX_AGE_HOURS'),
   };
+}
+
+function parseBoolean(value: string | undefined): boolean {
+  if (value === undefined || value === '') return false;
+  return value === '1' || value.toLowerCase() === 'true';
+}
+
+// API 轮询从 v0.2 起默认关闭：屏幕扫描已经覆盖所有触发场景，API 调用仅在屏幕触发时按需取 reset 时间
+// - 默认行为：关闭（disableApiPoll = true）
+// - 新 opt-in: CC_AUTORESUME_ENABLE_API_POLL=1
+// - 旧兼容:   CC_AUTORESUME_DISABLE_API_POLL=1（显式关闭，老脚本无感）
+function resolveDisableApiPoll(env: NodeJS.ProcessEnv): boolean {
+  if (parseBoolean(env.CC_AUTORESUME_DISABLE_API_POLL)) return true;
+  if (parseBoolean(env.CC_AUTORESUME_ENABLE_API_POLL)) return false;
+  return true; // 新默认
 }
 
 export function expandHome(value: string): string {
@@ -52,25 +79,37 @@ export function expandHome(value: string): string {
 }
 
 function parseArgs(argv: string[]): { target?: string; targetArgs: string[] } {
-  const separatorIndex = argv.indexOf('--');
-  const optionArgs = separatorIndex === -1 ? argv : argv.slice(0, separatorIndex);
-  const targetArgs = separatorIndex === -1 ? [] : argv.slice(separatorIndex + 1);
   let target: string | undefined;
+  const targetArgs: string[] = [];
+  let passthrough = false;
 
-  for (let index = 0; index < optionArgs.length; index += 1) {
-    const arg = optionArgs[index];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (passthrough) {
+      targetArgs.push(arg);
+      continue;
+    }
+
+    if (arg === '--') {
+      passthrough = true;
+      continue;
+    }
+
     if (arg.startsWith('--target=')) {
       target = arg.slice('--target='.length);
       continue;
     }
     if (arg === '--target') {
-      const value = optionArgs[index + 1];
-      if (!value) throw new Error('--target 需要一个值');
+      const value = argv[index + 1];
+      if (!value || value.startsWith('-')) throw new Error('--target 需要一个值');
       target = value;
       index += 1;
       continue;
     }
-    throw new Error(`未知参数：${arg}`);
+
+    // wrapper 不认识的参数一律透传给目标 CLI
+    targetArgs.push(arg);
   }
 
   return { target, targetArgs };

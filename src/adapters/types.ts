@@ -47,3 +47,18 @@ export function isSubscriptionSnapshot(value: AdapterResult): value is Subscript
 export function isBalanceSnapshot(value: AdapterResult): value is BalanceUsageSnapshot {
   return !isAdapterError(value) && value.kind === 'balance';
 }
+
+// 从订阅快照里取较晚的 reset 时间。屏幕触发暂停时不知道哪个窗口饱和，
+// 取较晚者以避免唤醒后又 verify 失败导致 push 5h 的浪费
+export function getLatestKnownResetMs(snapshot: SubscriptionUsageSnapshot): number | undefined {
+  const five = parseIsoMs(snapshot.five_hour?.resets_at);
+  const seven = parseIsoMs(snapshot.seven_day?.resets_at);
+  if (five !== undefined && seven !== undefined) return Math.max(five, seven);
+  return five ?? seven;
+}
+
+function parseIsoMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}

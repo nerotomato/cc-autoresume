@@ -6,9 +6,9 @@ import { isAdapterError, isBalanceSnapshot, isSubscriptionSnapshot } from './ada
 export type SchedulerEvent =
   | { type: 'snapshot'; snapshot: UsageSnapshot }
   | { type: 'balance-warning'; snapshot: BalanceUsageSnapshot }
-  | { type: 'pause-due'; trigger: Exclude<PauseTrigger, 'screen' | null>; resetsAt: string; wakeAt: string; mode: 'paused' | 'paused_long' }
+  | { type: 'pause-due'; trigger: Exclude<PauseTrigger, 'screen' | 'manual' | null>; resetsAt: string; wakeAt: string; mode: 'paused' | 'paused_long' }
   | { type: 'wake-due' }
-  | { type: 'verify-failed'; attempt: number; maxAttempts: number; error?: string }
+  | { type: 'verify-pushed'; attempt: number; nextWakeAt: string; error?: string }
   | { type: 'error'; error: string };
 
 export interface TimerApi {
@@ -26,8 +26,8 @@ export interface SchedulerOptions {
   wakeBufferMs: number;
   onEvent: (event: SchedulerEvent) => void | Promise<void>;
   timer?: TimerApi;
-  maxVerifyAttempts?: number;
-  verifyRetryMs?: number;
+  defaultWaitMs?: number;     // verify 失败后顺延这么久重试，默认 5h
+  disablePolling?: boolean;   // 关闭主动轮询（屏幕扫描单跑模式）；同时跳过唤醒前 verify
 }
 
 export class Scheduler {
@@ -37,19 +37,19 @@ export class Scheduler {
   private verifyTimer?: unknown;
   private failureCount = 0;
   private verifyAttempt = 0;
+  private skipVerifyForCurrentPause = false;
   private readonly timer: TimerApi;
-  private readonly maxVerifyAttempts: number;
-  private readonly verifyRetryMs: number;
+  private readonly defaultWaitMs: number;
 
   constructor(private readonly options: SchedulerOptions) {
     this.timer = options.timer ?? realTimer;
-    this.maxVerifyAttempts = options.maxVerifyAttempts ?? 5;
-    this.verifyRetryMs = options.verifyRetryMs ?? 60_000;
+    this.defaultWaitMs = options.defaultWaitMs ?? 5 * 60 * 60 * 1000;
   }
 
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    if (this.options.disablePolling) return;
     this.schedulePoll(0);
   }
 
@@ -63,16 +63,18 @@ export class Scheduler {
     this.clearWakeTimers();
     this.verifyAttempt = 0;
     this.failureCount = 0;
+    this.skipVerifyForCurrentPause = false;
     this.schedulePoll(0);
   }
 
-  pauseUntil(wakeAt: string): void {
+  pauseUntil(wakeAt: string, options: { skipVerify?: boolean } = {}): void {
     const wakeAtMs = new Date(wakeAt).getTime();
     if (!Number.isFinite(wakeAtMs)) {
       void this.emit({ type: 'error', error: `无效的唤醒时间：${wakeAt}` });
       return;
     }
     this.clearPollTimer();
+    this.skipVerifyForCurrentPause = options.skipVerify ?? false;
     this.scheduleWake(wakeAtMs);
   }
 
@@ -127,7 +129,11 @@ export class Scheduler {
     });
 
     this.clearPollTimer();
-    if (mode === 'paused') this.scheduleWake(decision.wakeAtMs);
+    if (mode === 'paused') {
+      // API 路径触发的暂停一定要 verify（默认值），重置 flag
+      this.skipVerifyForCurrentPause = false;
+      this.scheduleWake(decision.wakeAtMs);
+    }
   }
 
   private async handleAdapterError(error: AdapterError): Promise<void> {
@@ -141,6 +147,11 @@ export class Scheduler {
     if (this.stopped) return;
     const delayMs = Math.max(0, wakeAtMs - this.timer.now());
     this.wakeTimer = this.timer.setTimeout(() => {
+      if (this.options.disablePolling || this.skipVerifyForCurrentPause) {
+        // 屏幕扫描触发的暂停 / 主动关闭 API 轮询：跳过 verify，直接发唤醒事件
+        void this.emit({ type: 'wake-due' });
+        return;
+      }
       void this.verifyBeforeWake();
     }, delayMs);
   }
@@ -157,16 +168,14 @@ export class Scheduler {
     }
 
     const error = isAdapterError(result) ? result.error : 'usage 仍未降到安全阈值';
-    await this.emit({ type: 'verify-failed', attempt: this.verifyAttempt, maxAttempts: this.maxVerifyAttempts, error });
-
-    if (this.verifyAttempt >= this.maxVerifyAttempts) {
-      await this.emit({ type: 'error', error: '唤醒前校验达到最大重试次数，请手动处理当前 CLI' });
-      return;
-    }
-
-    this.verifyTimer = this.timer.setTimeout(() => {
-      void this.verifyBeforeWake();
-    }, this.verifyRetryMs);
+    const nextWakeAtMs = this.timer.now() + this.defaultWaitMs;
+    await this.emit({
+      type: 'verify-pushed',
+      attempt: this.verifyAttempt,
+      nextWakeAt: new Date(nextWakeAtMs).toISOString(),
+      error,
+    });
+    this.scheduleWake(nextWakeAtMs);
   }
 
   private clearTimers(): void {

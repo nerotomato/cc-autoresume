@@ -1,9 +1,19 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { AdapterError, SubscriptionUsageSnapshot, UsageAdapter, UsageWindow } from './types';
 
 const usageEndpoint = 'https://api.anthropic.com/api/oauth/usage';
+
+// 模块级 token 缓存。主要服务于 CC_AUTORESUME_ENABLE_API_POLL=1 的高频轮询场景
+// （命中率可达 99%+）。默认（屏幕扫描 only）下，整个会话最多触发 1 次 token 读取，
+// 缓存基本不被命中——保留这层是为 opt-in 用户兜底，运行时开销为零。
+let cachedToken: string | undefined;
+
+export function invalidateAnthropicToken(): void {
+  cachedToken = undefined;
+}
 
 export const anthropicAdapter: UsageAdapter = {
   id: 'anthropic',
@@ -24,7 +34,11 @@ export const anthropicAdapter: UsageAdapter = {
         },
       });
 
-      if (!response.ok) return classifyHttpError(response.status);
+      if (!response.ok) {
+        // token 被 Claude Code 轮换过会回 401/403，清掉缓存让下次重读
+        if (response.status === 401 || response.status === 403) invalidateAnthropicToken();
+        return classifyHttpError(response.status);
+      }
 
       const body = await response.json();
       const parsed = parseAnthropicUsageResponse(body, Date.now());
@@ -37,14 +51,57 @@ export const anthropicAdapter: UsageAdapter = {
 };
 
 export async function readAnthropicToken(env: NodeJS.ProcessEnv): Promise<string | undefined> {
-  if (env.ANTHROPIC_AUTH_TOKEN) return env.ANTHROPIC_AUTH_TOKEN;
-  if (env.CLAUDE_CODE_OAUTH_TOKEN) return env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (cachedToken) return cachedToken;
+
+  if (env.ANTHROPIC_AUTH_TOKEN) {
+    cachedToken = env.ANTHROPIC_AUTH_TOKEN;
+    return cachedToken;
+  }
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) {
+    cachedToken = env.CLAUDE_CODE_OAUTH_TOKEN;
+    return cachedToken;
+  }
+
+  // 优先 OS 原生凭据库：Claude Code 新版本在 macOS 上把 token 存 Keychain，
+  // ~/.claude/.credentials.json 可能是旧登录流程的过期副本
+  const fromKeychain = tryReadKeychain();
+  if (fromKeychain) {
+    cachedToken = fromKeychain;
+    return cachedToken;
+  }
 
   const credentialsPath = path.join(os.homedir(), '.claude', '.credentials.json');
   try {
     const raw = await fs.readFile(credentialsPath, 'utf8');
-    const json = JSON.parse(raw) as unknown;
-    return findToken(json);
+    const token = extractClaudeOAuthToken(raw);
+    if (token) cachedToken = token;
+    return token;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryReadKeychain(): string | undefined {
+  if (process.platform !== 'darwin') return undefined;
+  try {
+    const result = spawnSync(
+      'security',
+      ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+      { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    if (result.status !== 0 || !result.stdout) return undefined;
+    return extractClaudeOAuthToken(result.stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+function extractClaudeOAuthToken(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as { claudeAiOauth?: { accessToken?: string } };
+    return parsed.claudeAiOauth?.accessToken;
   } catch {
     return undefined;
   }
@@ -117,29 +174,6 @@ function normalizeResetAt(value: unknown): string | undefined {
     return new Date(ms).toISOString();
   }
 
-  return undefined;
-}
-
-function findToken(value: unknown): string | undefined {
-  const record = asRecord(value);
-  if (!record) return undefined;
-
-  const direct = firstString(record, ['accessToken', 'access_token', 'oauthToken', 'oauth_token']);
-  if (direct) return direct;
-
-  for (const key of ['claudeAiOauth', 'claude_ai_oauth', 'oauth', 'auth']) {
-    const nested = findToken(record[key]);
-    if (nested) return nested;
-  }
-
-  return undefined;
-}
-
-function firstString(record: Record<string, unknown>, keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === 'string' && value.length > 0) return value;
-  }
   return undefined;
 }
 

@@ -11,6 +11,41 @@ describe('parseConfig', () => {
     expect(config.balanceWarn).toBe(5);
     expect(config.resumeHint).toBe('继续');
     expect(config.adapter).toBe('auto');
+    // v0.2: API 轮询默认关闭，屏幕扫描为主
+    expect(config.disableApiPoll).toBe(true);
+    expect(config.disableScreenScan).toBe(false);
+    expect(config.restoreMaxAgeHours).toBe(24);
+    expect(config.statePath.endsWith(`.cc-autoresume/state-${process.pid}.json`)).toBe(true);
+    expect(config.stateDir.endsWith('.cc-autoresume')).toBe(true);
+  });
+
+  it('CC_AUTORESUME_STATE_PATH 可覆盖当前 wrapper 的状态文件路径', () => {
+    const config = parseConfig([], { CC_AUTORESUME_STATE_PATH: '/tmp/cc-autoresume-state.json' });
+
+    expect(config.statePath).toBe('/tmp/cc-autoresume-state.json');
+  });
+
+  it('CC_AUTORESUME_RESTORE_MAX_AGE_HOURS 可覆盖默认值', () => {
+    const config = parseConfig([], { CC_AUTORESUME_RESTORE_MAX_AGE_HOURS: '72' });
+    expect(config.restoreMaxAgeHours).toBe(72);
+  });
+
+  it('CC_AUTORESUME_ENABLE_API_POLL=1 时开启 API 轮询（opt-in）', () => {
+    const config = parseConfig([], { CC_AUTORESUME_ENABLE_API_POLL: '1' });
+    expect(config.disableApiPoll).toBe(false);
+  });
+
+  it('CC_AUTORESUME_DISABLE_API_POLL=1 保留向后兼容，显式关闭', () => {
+    const config = parseConfig([], { CC_AUTORESUME_DISABLE_API_POLL: '1' });
+    expect(config.disableApiPoll).toBe(true);
+  });
+
+  it('DISABLE 和 ENABLE 同时设置时 DISABLE 优先（保守）', () => {
+    const config = parseConfig([], {
+      CC_AUTORESUME_ENABLE_API_POLL: '1',
+      CC_AUTORESUME_DISABLE_API_POLL: '1',
+    });
+    expect(config.disableApiPoll).toBe(true);
   });
 
   it('解析 target 和透传参数', () => {
@@ -43,7 +78,22 @@ describe('parseConfig', () => {
     expect(config.targetCommandOverride).toBe('/bin/zsh');
   });
 
-  it('拒绝未知参数', () => {
-    expect(() => parseConfig(['--bad'], {})).toThrow('未知参数');
+  it('未知参数自动透传给目标 CLI（不需要 -- 分隔符）', () => {
+    const config = parseConfig(['--target=claude', '--allow-dangerously-skip-permissions', '--add-dir', '/tmp'], {});
+
+    expect(config.target).toBe('claude');
+    expect(config.targetArgs).toEqual(['--allow-dangerously-skip-permissions', '--add-dir', '/tmp']);
+  });
+
+  it('-- 分隔符仍然有效（用于完全显式透传，含 --target 字面量）', () => {
+    const config = parseConfig(['--target=claude', '--', '--target=foo'], {});
+
+    expect(config.target).toBe('claude');
+    expect(config.targetArgs).toEqual(['--target=foo']);
+  });
+
+  it('--target 后缺少值时抛错', () => {
+    expect(() => parseConfig(['--target'], {})).toThrow('--target 需要一个值');
+    expect(() => parseConfig(['--target', '--foo'], {})).toThrow('--target 需要一个值');
   });
 });
