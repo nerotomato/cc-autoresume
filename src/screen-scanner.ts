@@ -20,6 +20,7 @@ export interface ScreenScannerOptions {
   busyDebounceMs?: number;
   rateLimitDebounceMs?: number;
   bufferSize?: number;
+  recentBusyMs?: number;
 }
 
 export interface ScreenScanner {
@@ -35,17 +36,17 @@ export function createScreenScanner(options: ScreenScannerOptions): ScreenScanne
   const busyDebounceMs = options.busyDebounceMs ?? 2000;
   const rateLimitDebounceMs = options.rateLimitDebounceMs ?? 300;
   const bufferSize = options.bufferSize ?? 4096;
+  const recentBusyMs = options.recentBusyMs ?? 10_000;
 
   let buffer = '';
   let busyState: BusyStateName = 'IDLE';
-  let lastBusyAt = 0;
+  let lastBusyAt = Number.NEGATIVE_INFINITY;
   let lastLimitFiredAt = Number.NEGATIVE_INFINITY;
   let paused = false;
 
   function feed(chunk: string): void {
     if (paused || chunk.length === 0) return;
 
-    // 当前 chunk 更新 busy 状态（只看新输入，避免历史 marker 反复触发）
     if (options.triggerSet.busyMarkers.some((m) => m.test(chunk))) {
       busyState = 'BUSY';
       lastBusyAt = now();
@@ -59,6 +60,9 @@ export function createScreenScanner(options: ScreenScannerOptions): ScreenScanne
 
     const t = now();
     if (t - lastLimitFiredAt < rateLimitDebounceMs) return;
+
+    // 只有 CLI 最近处于 BUSY 状态才触发——IDLE 下出现的错误文本是用户粘贴，不是真实报错
+    if (busyState !== 'BUSY' && t - lastBusyAt > recentBusyMs) return;
 
     const match = findLimitMatch(buffer, options.triggerSet);
     if (!match) return;

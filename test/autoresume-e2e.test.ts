@@ -215,11 +215,14 @@ const log = process.env.FAKE_TARGET_STDIN_LOG;
 process.stdin.resume();
 process.stdin.on('data', (chunk) => fs.appendFileSync(log, chunk.toString('utf8')));
 setTimeout(() => {
-  process.stdout.write("You've hit your session limit · resets 3:10pm (Asia/Shanghai)\\n");
-  process.stdout.write("What do you want to do?\\n");
-  process.stdout.write("❯ 1. Stop and wait for limit to reset\\n");
-  process.stdout.write("  2. Upgrade your plan\\n");
-  process.stdout.write("try again in 10 minutes\\n");
+  process.stdout.write("\\u280b Working...\\n");
+  setTimeout(() => {
+    process.stdout.write("You've hit your session limit \\u00b7 resets 3:10pm (Asia/Shanghai)\\n");
+    process.stdout.write("What do you want to do?\\n");
+    process.stdout.write("\\u276f 1. Stop and wait for limit to reset\\n");
+    process.stdout.write("  2. Upgrade your plan\\n");
+    process.stdout.write("try again in 10 minutes\\n");
+  }, 50);
 }, 100);
 process.on('SIGTERM', () => process.exit(0));
 setInterval(() => {}, 1000);
