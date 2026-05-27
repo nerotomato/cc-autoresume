@@ -3,7 +3,7 @@ export interface WritablePty {
 }
 
 export interface WakeSequenceOptions {
-  target: 'claude' | 'codex';
+  target: 'claude' | 'codex' | 'ccs';
   resumeHint: string;
   delayMs?: number;
   sleep?: (ms: number) => Promise<void>;

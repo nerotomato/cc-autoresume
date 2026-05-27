@@ -3,237 +3,256 @@
 [![English](https://img.shields.io/badge/lang-English-lightgrey)](./README.md)
 [![简体中文](https://img.shields.io/badge/lang-简体中文-blue)](./README.zh-CN.md)
 
-> 一个**命令行工具**，把 Claude Code / Codex CLI 包在 PTY 里运行；在订阅额度即将耗尽时自动暂停，等额度重置后自动唤醒并继续对话。
+> 一个命令行 wrapper，用 PTY 包住 Claude Code / Codex / ccs；检测到订阅额度限制后自动暂停，等额度重置后在同一个终端会话里自动恢复。
 
 ## 1. 这是什么
 
-`cc-autoresume` 是一个 **CLI 工具**（安装后会有一个 `cc-autoresume` 可执行命令），不是服务、不是守护进程、不是 GUI。你像运行 `claude` / `codex` 一样在终端里运行它，它会在内部用 PTY 拉起真正的目标 CLI，体验和直接启动目标 CLI 完全一致。
+`cc-autoresume` 是一个 CLI 工具，安装后提供 `cc-autoresume` 可执行命令。它不是守护进程、不是服务、不是 GUI，也不会替代 Claude Code / Codex / ccs。你用它替换平时启动目标 CLI 的命令，它会在内部用 PTY 启动真正的目标进程，所以 stdin、stdout、raw mode、窗口大小变化和信号转发都保持原生终端体验。
 
-它用来解决长时间使用 Claude Code（或 Codex CLI）订阅版时被 **5 小时 / 7 天额度** 卡住的问题。
+它解决的是长时间使用 Claude Code 时，5 小时 / 7 天订阅额度耗尽后会卡住等待的问题。检测到限额后，`cc-autoresume` 会记录唤醒时间、暂停等待，并在额度重置后向同一个 PTY 注入配置好的恢复提示词；如果用户已经回到终端继续操作，则不会打扰。
 
-> ⚠️ **这个工具不会替代 Claude Code / Codex，它只是包装它们。** 你必须先在本机装好可用的 `claude` 和/或 `codex` CLI，详见下文 [前提依赖](#4-前提依赖)。
-
-它在你和真正的 `claude` / `codex` CLI 之间架了一层。**默认只做一件事**：实时监听被包装 CLI 的输出，对照内置关键词表（Claude / Codex / 国内大模型通用中文）匹配限额错误（**屏幕扫描**，事件驱动、零延迟、覆盖任意 CLI），一旦撞墙立即暂停。
-
-暂停触发时，wrapper 会**按需调一次** Anthropic OAuth `usage` 接口（前提是能拿到 token）取精确 `resets_at`。整个生命周期的网络消耗就这么多——**没有周期性轮询**。
-
-等额度重置时，wrapper 会先看用户是不是已经回到终端在用：如果在用，就**保持静默不打扰**；如果还是离开状态，就注入 `ESC` + 提示词 + `Enter`，让原任务继续跑下去。
-
-如果你需要预防性暂停（撞墙前主动停），设 `CC_AUTORESUME_ENABLE_API_POLL=1` 打开周期性 API 轮询。
-
-整个过程中，你看到的仍然是原生 `claude` / `codex` 的终端体验：输入、输出、TTY 大小、原始模式、信号转发都被完整透传。
+对官方 Anthropic provider 下的 Claude Code，现在主路径是读取 Claude Code `statusLine` stdin 里的结构化 `rate_limits` 数据。对 Codex、ccs 第三方 provider，以及没有稳定 `rate_limits` 的模型输出，仍保留屏幕扫描和自定义 triggers 作为降级方案。
 
 ## 2. 工作原理
 
+```text
+cc-autoresume claude [args]
+  │
+  ├─ 启动 PTY wrapper
+  │
+  ├─ 对 claude / ccs 启动方式：
+  │   ├─ 读取用户现有 ~/.claude/settings.json 里的 statusLine command
+  │   ├─ 在 ~/.cc-autoresume/ 生成临时 spy 脚本
+  │   ├─ 注入 --settings '{"statusLine":{"command":"spy"}}'
+  │   └─ 通过 spy 保留用户原有 statusLine 输出
+  │
+  ├─ Claude Code 运行中：
+  │   ├─ Claude Code 按自己的 statusLine 刷新节奏调用 command
+  │   ├─ spy 把 stdin JSON 写入 rate-limits-<pid>.json
+  │   ├─ spy 把同一份 JSON 透传给用户原 statusLine command
+  │   └─ RateLimitsWatcher 读取本地文件并检测 threshold
+  │
+  ├─ 撞墙 / 到达阈值时：
+  │   ├─ 写入 state-<pid>.json
+  │   ├─ 写入 statusline-hint-<pid>.txt
+  │   ├─ 在 statusLine 末尾追加自动恢复提示
+  │   └─ 调度 wake_at = resets_at + buffer
+  │
+  └─ 唤醒 / 退出时：
+      ├─ 清除 statusLine hint
+      ├─ 删除临时 spy/runtime 文件
+      └─ 需要时恢复同一个 PTY 会话
 ```
-              ┌─────────────────────────────────────────────────┐
-              │                  cc-autoresume                  │
-              │                                                 │
-   你的终端 ──▶│   ┌─────────────────────────────────────────┐   │──▶ claude / codex
-              │   │ 屏幕扫描器（事件驱动，默认且唯一）      │   │   (跑在 node-pty 子进程里)
-              │   │   • 匹配限额错误关键词                  │   │
-              │   │   • 追踪 BUSY / IDLE 状态               │   │
-              │   │   • 撞墙时按需调一次 Anthropic API      │   │
-              │   │     取精确 resets_at（有 token 才调）   │   │
-              │   └─────────────────────────────────────────┘   │
-              │              │ 暂停 / 唤醒                       │
-              │   ESC + 提示词 + Enter（仅在用户离开时）         │
-              └─────────────────────────────────────────────────┘
-                      │
-                      ▼
-              ~/.cc-autoresume/{state-<pid>.json, log.jsonl}
 
-   Opt-in: CC_AUTORESUME_ENABLE_API_POLL=1 可同时启用
-   周期性 API 轮询，实现预防性暂停
-```
+主要模块：
 
-- **wrapper** (`src/wrapper.ts`)：用 [`node-pty`](https://github.com/microsoft/node-pty) fork 一个 PTY 子进程跑目标 CLI，把 stdin/stdout/SIGWINCH/SIGINT/SIGTERM 桥接过去；子进程输出同时喂给屏幕扫描器。
-- **screen-scanner** (`src/screen-scanner.ts`)：剥离 ANSI、维护滑动缓冲、匹配关键词、抽取 reset 时间、并跑一个由 spinner / cursor-hide marker 驱动的 BUSY/IDLE 状态机。
-- **triggers** (`src/triggers/`)：`claude` / `codex` / 通用中文（DeepSeek / Qwen / Doubao / GLM）三套内置关键词表，可被 `~/.cc-autoresume/triggers.json` 追加扩展。
-- **adapter** (`src/adapters/anthropic.ts`)：调用 `https://api.anthropic.com/api/oauth/usage`，既用于周期性轮询，也作为屏幕触发时的 reset 时间兜底（一次性调用）。
-- **scheduler** (`src/scheduler.ts`)：管理唤醒定时器；唤醒前做一次校验，校验不通过就把唤醒时间再推 `defaultWaitHours`（默认 5h），如此循环直到利用率降下来为止。
-- **state-machine** (`src/state-machine.ts`)：决定唤醒时间的优先级（文本抽取 → API → 默认值）、以及超过 `maxWaitHours` 的 `paused_long` 模式。
+- **wrapper** (`src/wrapper.ts`)：通过 `node-pty` 启动目标 CLI，桥接终端 I/O，注入临时 statusLine settings，管理暂停/唤醒清理，并发送恢复按键序列。
+- **statusline-spy** (`src/statusline-spy.ts`)：生成临时 spy 脚本，保留用户原 statusLine command，写入捕获到的 JSON，写入/清除自动恢复提示，并清扫陈旧 runtime 文件。
+- **rate-limits-watcher** (`src/rate-limits-watcher.ts`)：轮询很小的本地 `rate-limits-<pid>.json` 文件，解析 `rate_limits.five_hour` / `seven_day`，按 `CC_AUTORESUME_THRESHOLD` 触发暂停，并对同一轮限额做防抖。
+- **screen-scanner** (`src/screen-scanner.ts`)：Codex、ccs 第三方 provider、只打印文本限额错误的 CLI 使用的降级检测器；它会剥离 ANSI、维护滚动缓冲、匹配 triggers，并追踪 BUSY / IDLE 状态。
+- **scheduler** (`src/scheduler.ts`)：管理唤醒 timer 和墙钟 heartbeat，避免电脑休眠后 `setTimeout` 被冻住导致错过唤醒时间。
+- **triggers** (`src/triggers/`)：内置 Claude、Codex、通用中文模型限额提示关键词，可用 `~/.cc-autoresume/triggers.json` 追加扩展。
 
-### 暂停后到底会不会自动恢复？
+## 3. 检测路径
 
-| 触发源 | 触发时用户 BUSY？ | `auto_resume` | 唤醒时行为 |
-|---|---|---|---|
-| 屏幕扫描捕获到限额错误 | （定义上必然 BUSY） | `true` | 注入 `ESC + 提示词 + Enter` |
-| API 轮询 `utilization ≥ threshold`，且 5s 内屏幕扫描看到过 BUSY | 是 | `true` | 注入 `ESC + 提示词 + Enter` |
-| API 轮询 `utilization ≥ threshold`，但用户当前 IDLE | 否 | `false` | 只清状态，不注入任何东西 |
-| 任意路径，但唤醒到点时检测到用户已自己回来用 | — | （被覆盖） | 跳过注入——用户已经回来了 |
-
-最后一条"唤醒前再看一眼"避免了一个常见坑：你 5h 后没回来 → wrapper 自动续上；但如果你提前回来开了新任务，wrapper 就不会再硬塞"继续"打乱你的上下文。
-
-### 轮询开销说明 —— 会不会一直占资源？
-
-**默认模式（只屏幕扫描）**：环境零开销。屏幕扫描是 PTY 数据流的事件回调，没有定时器、没有轮询、不碰网络。整个生命周期的网络消耗：**每次撞墙最多 1 次 HTTPS GET**（取 `resets_at`，如果能拿到 token）。典型会话：0 次 API 调用；撞墙一次：1 次。
-
-**Opt-in：`CC_AUTORESUME_ENABLE_API_POLL=1`** 会开启周期性 API 轮询用于预防性暂停。节奏按当前最高利用率自适应：
-
-| 当前最高利用率 | 轮询间隔 |
-|---|---|
-| `< 80%` | 每 **10 分钟** 一次 |
-| `80% – 95%` | 每 **2 分钟** 一次 |
-| `95% – 99%` | 每 **30 秒** 一次 |
-| `≥ 99%`（即将触顶） | 每 **10 秒** 一次 |
-| Adapter 报错（暂时性 / 鉴权失败） | 指数退避，最多 **5 分钟** |
-| **暂停期间** | **完全不轮询**，只挂一个定时器等到 reset |
-
-**没有后台守护进程**——你一退出 `cc-autoresume`，所有定时器立即销毁。
-
-> **为什么默认关 API 轮询？** 屏幕扫描已经能即时捕获所有限额事件，预防性暂停的实际价值有限（用户撞墙前通常自己也会停）。默认关闭让 Codex / 国内大模型用户、以及没登录 OAuth 的 Anthropic 用户都能开箱即用，日志里不会出现"找不到 token"的报错。
-
-## 3. 输出物
-
-| 路径 | 作用 | 覆盖 |
+| 启动命令 | 主检测方式 | 说明 |
 |---|---|---|
-| `~/.cc-autoresume/state-<pid>.json` | 当前 wrapper 状态快照（`version: 2`），含 `trigger`（`5h`/`7d`/`both`/`screen`/`manual`）、`auto_resume` 标志、`wake_source`（`api`/`text`/`default`）、唤醒时间、PID 等 | `CC_AUTORESUME_STATE_PATH`（显式切回单文件模式） |
-| `~/.cc-autoresume/log.jsonl` | 行式 JSON 日志，记录每一次 `startup` / `snapshot` / `pause_due` / `screen_pause_due` / `wake_sent` / `wake_skipped_user_active` / `verify_pushed` 等事件 | `CC_AUTORESUME_LOG` |
-| 终端横幅 | 暂停 / 唤醒 / 校验推迟 / 余额预警时打印到 stderr 的一行提示，不污染被包装 CLI 的正常输出 | — |
+| `cc-autoresume claude` / `cc-autoresume --target=claude` | 官方 Anthropic endpoint 下使用 statusLine spy + `rate_limits` watcher | `ANTHROPIC_BASE_URL` 为空或指向官方 Anthropic 时启用；屏幕扫描默认仍作为兜底 |
+| `cc-autoresume ccs claude` | statusLine spy + `rate_limits` watcher | `--settings` 会注入到 `claude` provider 参数后面，并通过 ccs 传给 Claude Code |
+| `cc-autoresume ccs codex` / `cc-autoresume ccs glm` | 屏幕扫描 + 自定义 triggers | spy 仍可保留/追加 statusLine 输出，但不把第三方 provider 的 `rate_limits` 当成稳定契约 |
+| `cc-autoresume codex` / `cc-autoresume --target=codex` | 屏幕扫描 + 自定义 triggers | 不需要 Anthropic 鉴权 |
 
-## 4. 前提依赖
+wrapper 不再做周期性 Anthropic API polling。官方 Claude 主路径读取的是 statusLine spy 写出的本地 JSON 文件；屏幕扫描路径则是 PTY 输出事件驱动。
 
-在安装 `cc-autoresume` 之前，请确保：
+## 4. statusLine 兼容性
 
-| 依赖项 | 原因 |
-|---|---|
-| **Node.js ≥ 20** | wrapper 自身在 Node 20+ 运行；`node-pty` 预编译二进制也面向该范围 |
-| **本机已安装 `claude` 和/或 `codex` CLI** | 本工具只是**包装**它们，不会自带也不会替代它们。请用 `which claude` / `which codex` 确认。Claude Code 安装指引见 [claude.com/claude-code](https://www.claude.com/claude-code) |
-| **Claude Code 已登录** *（仅 API 轮询路径需要）* | `cc-autoresume` 会读取 `~/.claude/.credentials.json`（Claude Code 在 `claude login` 之后写入的文件）。也可以显式设置 `ANTHROPIC_AUTH_TOKEN` 或 `CLAUDE_CODE_OAUTH_TOKEN`。Codex / 国内大模型走屏幕扫描，不需要 token |
-| **有效的 Claude 订阅** *（仅 API 轮询路径需要）* | `usage` 接口只为订阅账号返回 5h / 7d 窗口数据。Codex / 国内大模型走屏幕扫描，无需订阅 |
+`cc-autoresume` 不要求用户安装 `cc-usage-bar` 或任何 statusLine 工具，也不会永久修改 `~/.claude/settings.json`。
 
-如果 `claude` 不在 `PATH` 上，`cc-autoresume --target=claude` 会直接以 `command not found` 退出——请先修好底层 CLI 的安装。
+启动时它会读取当前 statusLine command，然后用临时 `--settings` 启动 Claude Code，让 statusLine command 指向 spy 脚本。spy 做三件事：
 
-## 5. 安装
+1. 把 Claude Code 推给 statusLine 的 stdin JSON 写到 `rate-limits-<pid>.json`；
+2. 如果用户原本有 statusLine command，把同一份 JSON 继续喂给原 command；
+3. 当 wrapper 正在等待自动恢复时，在原 statusLine 输出后追加 `cc-autoresume` 提示。
 
-### 方式 A：从 npm 市场安装（推荐）
+示例：
 
-> 🚧 包尚未发布到 npm，发布后即可使用以下命令。
+```text
+# RateLimitsWatcher 检测到接近额度上限（utilization >= threshold）
+original-status | cc-autoresume: 接近额度上限，14:03:30 自动恢复
+
+# 屏幕扫描检测到已达额度上限（Claude Code 输出了限额提示文本）
+original-status | cc-autoresume: 已达额度上限，14:03:30 自动恢复
+
+# 用户没有 statusLine；只会在暂停等待期间显示
+cc-autoresume: 接近额度上限，14:03:30 自动恢复
+```
+
+所有额度类型（包括 7 天周额度）均会调度自动恢复。wrapper 会保持运行，在额度重置后唤醒会话。
+
+唤醒、跳过唤醒或 wrapper 退出后，hint 文件会被删除。下一次 statusLine 刷新时，追加提示就会消失。
+
+## 5. ccs 支持
+
+可以直接包住 `ccs`：
 
 ```bash
-# 全局安装
-npm install -g cc-autoresume
+# 通过 ccs 使用 Claude provider：走 statusLine rate_limits 路径
+cc-autoresume ccs claude
 
-# 验证
+# 通过 ccs 使用 Codex / GLM / 其它 provider：走屏幕扫描降级路径
+cc-autoresume ccs codex
+cc-autoresume ccs glm
+
+# 等价的显式 target 写法
+cc-autoresume --target=ccs -- claude
+```
+
+对 `ccs claude`，`cc-autoresume` 会把 `--settings <json>` 注入到 provider 名称之后，所以最终 Claude Code 进程能收到临时 statusLine 覆盖。
+
+对 `ccs codex`、`ccs glm` 和其它第三方 provider，`cc-autoresume` 不假设存在稳定的 `rate_limits` 结构。限额检测来自屏幕扫描和可选的自定义 triggers。
+
+## 6. 跨平台支持
+
+`cc-autoresume` 支持 **macOS、Linux 和 Windows**。
+
+| 平台 | PTY 后端 | 说明 |
+|---|---|---|
+| macOS / Linux | Unix PTY (`forkpty`) | 完整支持 |
+| Windows 10 1809+ | ConPTY | 需要 Windows Terminal 或支持 ConPTY 的终端 |
+
+statusLine spy 脚本是 Node.js 脚本（`.js`），通过 `node` 调用，在所有平台上行为一致，不依赖 bash 或其他 shell。
+
+Windows 上安装和使用方式相同 —— `npm install`、`npm run build`，然后在 PowerShell、cmd 或 Windows Terminal 中使用：
+
+```powershell
+# PowerShell / cmd
+cc-autoresume claude
+cc-autoresume claude -- --dangerously-skip-permissions
+```
+
+运行时文件（`~/.cc-autoresume/`）存储在用户主目录下（Windows 为 `%USERPROFILE%`，Unix 为 `$HOME`），通过 `os.homedir()` 统一解析。
+
+## 7. 前提依赖
+
+| 依赖 | 原因 |
+|---|---|
+| Node.js ≥ 20 | wrapper 和 `node-pty` 需要 |
+| 目标 CLI 已安装 | 本机需要已有可用的 `claude`、`codex` 和/或 `ccs` |
+| Claude Code 已登录 | 正常使用 Claude Code 需要；官方 statusLine `rate_limits` 也依赖登录态 |
+| 有效 Claude 订阅 | 如果希望拿到 5h / 7d 订阅窗口，需要订阅账号 |
+
+如果目标命令不在 `PATH` 上，`cc-autoresume` 会像直接运行该目标命令一样失败。
+
+## 8. 安装
+
+### 方式 A：从 npm 安装
+
+包尚未发布。发布后使用：
+
+```bash
+npm install -g cc-autoresume
 cc-autoresume --target=claude -- --help
 ```
 
-> 安装后 `postinstall` 脚本会自动给 `node-pty` 的 `spawn-helper` 补上可执行权限（修复部分 macOS / Linux 环境下的 EACCES 问题）。
-
-### 方式 B：从 GitHub 源码安装
+### 方式 B：从源码安装
 
 ```bash
-# 1. 克隆并构建
 git clone https://github.com/nerotomato/cc-autoresume.git
 cd cc-autoresume
 npm install
 npm run build
 
-# 2A. 直接用本地 bin（开发场景）
+# 直接运行本地 bin
 ./bin/cc-autoresume --target=claude
 
-# 2B. 软链接到全局 PATH
+# 或链接到 PATH
 npm link
 cc-autoresume --target=claude
 ```
 
-> `npm install` 会拉取 `node-pty` 并触发 `postinstall` 修复权限。
+## 9. 使用
 
-## 6. 使用
-
-最基本的用法：用 `cc-autoresume` 替换你平时启动 `claude` / `codex` 的命令。
+用 `cc-autoresume` 替换平时启动目标 CLI 的命令：
 
 ```bash
-# 自动识别 claude 或 codex
+# 自动检测：优先 claude，然后 codex
 cc-autoresume
 
-# 指定目标 CLI
-cc-autoresume --target=claude
-cc-autoresume --target=codex
+# 显式目标
+cc-autoresume claude
+cc-autoresume codex
+cc-autoresume ccs claude
+cc-autoresume ccs codex
 
-# 把参数透传给目标 CLI（用 -- 分隔）
-cc-autoresume --target=claude -- --resume
-cc-autoresume --target=claude -- "总结一下当前仓库"
+# 等价的 flag 写法
+cc-autoresume --target=claude
+cc-autoresume --target=ccs -- claude
+
+# 透传目标 CLI 参数
+cc-autoresume claude -- --resume
+cc-autoresume claude -- "总结一下当前仓库"
+cc-autoresume ccs claude -- --resume
 ```
 
-支持的命令行参数：
-
-| 参数 | 说明 |
+| 参数 / 写法 | 说明 |
 |---|---|
-| `--target=auto\|claude\|codex` | 选择目标 CLI，`auto` 时优先 `claude`，再 `codex` |
-| 任何其它 flag | cc-autoresume 自己不认识的参数会直接透传给目标 CLI——`cc-autoresume --target=claude --allow-dangerously-skip-permissions` 直接就能用 |
-| `-- <args...>` | 可选的显式分隔符。`--` 之后的内容无条件原样透传（当目标参数看起来像 wrapper 的 flag 时有用，比如 `-- --target=foo`） |
+| `cc-autoresume claude` / `codex` / `ccs ...` | 位置参数形式选择目标 |
+| `--target=auto\|claude\|codex\|ccs` | 显式选择目标；`auto` 时优先 `claude`，然后 `codex` |
+| `-- <args...>` | 显式分隔符，之后的内容原样透传给目标 CLI |
+| wrapper 不认识的 flag | 直接透传给目标 CLI |
 
-## 7. 配置（环境变量）
+## 10. 配置
 
-| 变量 | 默认 | 说明 |
+| 变量 | 默认值 | 说明 |
 |---|---|---|
 | `CC_AUTORESUME_TARGET` | `auto` | 等价于 `--target` |
-| `CC_AUTORESUME_THRESHOLD` | `99` | API utilization 达到该百分比即触发暂停（仅 API 轮询路径） |
-| `CC_AUTORESUME_MAX_WAIT_HOURS` | `12` | 唤醒等待若超过该小时数，进入 `paused_long`（只提示不自动唤醒） |
-| `CC_AUTORESUME_DEFAULT_WAIT_HOURS` | `5` | 拿不到 `resets_at` 时的兜底等待；唤醒前校验失败 push 也用这个 |
-| `CC_AUTORESUME_BALANCE_WARN` | `5` | 余额型 adapter 的低余额警告阈值 |
-| `CC_AUTORESUME_LOG` | `~/.cc-autoresume/log.jsonl` | 事件日志路径 |
-| `CC_AUTORESUME_STATE_PATH` | `~/.cc-autoresume/state-<pid>.json` | 状态文件路径。默认每个 wrapper 一份 PID 分片文件；设置该变量只会覆盖当前 wrapper 的状态文件路径 |
-| `CC_AUTORESUME_RESUME_HINT` | `继续` | 唤醒时注入到 CLI 的提示词 |
-| `CC_AUTORESUME_ADAPTER` | `auto` | `auto` / `mock` / `anthropic` |
-| `CC_AUTORESUME_DISABLE_SCREEN_SCAN` | — | 设为 `1` 关闭屏幕扫描（仅当同时打开 API 轮询时有意义） |
-| `CC_AUTORESUME_ENABLE_API_POLL` | — | 设为 `1` **打开**周期性 API 轮询用于预防性暂停（默认关；需要 Anthropic OAuth token） |
-| `CC_AUTORESUME_DISABLE_API_POLL` | — | 旧别名，向后兼容用；`1` 强制关闭 API 轮询（其实新默认已经关了） |
-| `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` | `24` | 启动清理时，PID 已死且 `paused_at` 超过这个小时数的 `state-*.json` 会被直接删除 |
-| `CC_AUTORESUME_TRIGGERS_FILE` | `~/.cc-autoresume/triggers.json` | 用户自定义关键词表路径 |
-| `CC_AUTORESUME_DISABLE_SESSION_TRACKING` | — | 设为 `1` 关闭"给 `claude` 自动注入 `--session-id`"。默认开启，仅 `target=claude` 时生效 |
-| `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT` | — | 设为 `1` 关闭暂停期间的墙钟心跳兜底。默认开启（修复 Mac 合盖唤醒后 `wake_at` 严重延迟的问题） |
-| `CC_AUTORESUME_LIMIT_MENU_KEYS` | — | 撞墙后向 `claude` 盲发的按键序列（用逗号分隔），如 `up,enter`。默认空（不操作菜单）。仅 `target=claude` 时生效 |
-| `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` | — | OAuth token，未配置时回退读取 `~/.claude/.credentials.json` |
+| `CC_AUTORESUME_THRESHOLD` | `99` | statusLine utilization 达到该百分比时暂停 |
+| `CC_AUTORESUME_DEFAULT_WAIT_HOURS` | `5` | 拿不到 reset 时间时的兜底等待 |
+| `CC_AUTORESUME_BALANCE_WARN` | `5` | 余额型 adapter 预留阈值 |
+| `CC_AUTORESUME_LOG` | `~/.cc-autoresume/log.jsonl` | JSONL 事件日志路径 |
+| `CC_AUTORESUME_STATE_DIR` | `~/.cc-autoresume` | per-PID state、spy、rate-limit、hint 文件所在目录 |
+| `CC_AUTORESUME_STATE_PATH` | `~/.cc-autoresume/state-<pid>.json` | 覆盖当前 wrapper 的 state 文件路径 |
+| `CC_AUTORESUME_RESUME_HINT` | `继续` | 唤醒时注入到 CLI 的文本 |
+| `CC_AUTORESUME_ADAPTER` | `auto` | `auto` / `mock` / `anthropic`；高级校验/测试开关 |
+| `CC_AUTORESUME_DISABLE_SCREEN_SCAN` | — | 设为 `1` 关闭屏幕扫描；只有 statusLine watcher 路径可用时才建议这样做 |
+| `CC_AUTORESUME_RATE_LIMITS_POLL_MS` | `10000` | 读取 `rate-limits-<pid>.json` 的本地文件轮询间隔 |
+| `CC_AUTORESUME_RATE_LIMITS_MAX_STALENESS_MS` | `120000` | 超过这个时间未更新的 statusLine JSON 会被忽略 |
+| `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` | `24` | 启动清理时，PID 已死的旧 state 文件超过该时长会被删除 |
+| `CC_AUTORESUME_TRIGGERS_FILE` | `~/.cc-autoresume/triggers.json` | 用户自定义 trigger 扩展文件 |
+| `CC_AUTORESUME_DISABLE_SESSION_TRACKING` | — | 设为 `1` 关闭给 `claude` 自动注入 `--session-id` |
+| `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT` | — | 设为 `1` 关闭暂停期间的墙钟 heartbeat |
+| `CC_AUTORESUME_LIMIT_MENU_KEYS` | — | 覆盖 Claude 撞墙菜单出现后发送的按键序列。空值表示 `claude` / `ccs claude` 内置默认发送 `enter`；可用 `up,enter` 等值覆盖 |
+| `ANTHROPIC_BASE_URL` | — | 为空/官方地址时启用 Claude statusLine watcher；非官方 Claude 启动走屏幕扫描降级 |
 
-## 8. 如何配置环境变量
-
-下面三种方式按使用频率挑：
-
-**一次性临时用（验证一个 flag 时最方便）**
+示例：
 
 ```bash
-CC_AUTORESUME_ENABLE_API_POLL=1 cc-autoresume --target=claude
+# 自定义恢复提示词
+CC_AUTORESUME_RESUME_HINT="额度恢复了，请继续之前的任务" cc-autoresume claude
+
+# 调整本地 statusLine JSON 读取间隔
+CC_AUTORESUME_RATE_LIMITS_POLL_MS=5000 cc-autoresume claude
+
+# 通过 ccs 使用 Claude provider
+cc-autoresume ccs claude
 ```
 
-只对这一次启动生效，退出后忘掉。
+## 11. 输出物与清理
 
-**当前 shell 会话持久（用 `export`）**
+| 路径 | 创建时机 | 作用 | 清理方式 |
+|---|---|---|---|
+| `~/.cc-autoresume/state-<pid>.json` | 暂停时 | 当前 wrapper 状态：target、PID、唤醒时间、trigger、auto-resume 标志、session id | 唤醒后清理；启动时清扫陈旧文件 |
+| `~/.cc-autoresume/log.jsonl` | 启动时 | 事件日志（`startup`、`wrapper_start`、`statusline_pause_due`、`screen_pause_due`、`wake_sent`、`verify_pushed`、`state_swept` 等） | 保留 |
+| `~/.cc-autoresume/spy-<pid>.js` | `claude` / `ccs` wrapper 启动时 | 临时 statusLine spy command | wrapper 退出时删除；后续启动会清扫 PID 已死的残留 |
+| `~/.cc-autoresume/rate-limits-<pid>.json` | 首次 statusLine 调用时 | 最近一次捕获到的 statusLine stdin JSON，每次刷新覆盖写 | wrapper 退出时删除；后续启动会清扫 PID 已死的残留 |
+| `~/.cc-autoresume/statusline-hint-<pid>.txt` | 暂停等待期间 | 追加到 statusLine 末尾的自动恢复提示 | 唤醒 / 跳过 / wrapper 退出时删除 |
+| `~/.cc-autoresume/triggers.json` | 用户创建 | 自定义屏幕扫描 triggers | cleanup 不会修改 |
 
-```bash
-export CC_AUTORESUME_RESUME_HINT="额度恢复了，请继续之前没跑完的任务"
-export CC_AUTORESUME_DEFAULT_WAIT_HOURS=4
-cc-autoresume --target=claude
-```
+这些 runtime 文件按 PID 隔离，多个终端 tab 不会互相覆盖。rate-limit 和 hint 文件都是覆盖写，不是追加写，大小保持稳定。
 
-关掉终端就没了，适合"今天调一调"。
+## 12. 自定义 trigger
 
-**跨会话永久（写进 shell rc）**
-
-把要长期生效的几行 `export` 加到你常用 shell 的启动文件：
-
-```bash
-# ~/.zshrc 或 ~/.bashrc
-export CC_AUTORESUME_RESUME_HINT="额度恢复了，请继续之前没跑完的任务"
-# 顺手把 claude 起手别名也写上，以后敲 claude 就自动包了 cc-autoresume：
-alias claude='cc-autoresume --target=claude'
-```
-
-改完 `source ~/.zshrc`（或新开一个终端）生效。
-
-**验证当前生效的值**
-
-```bash
-env | grep CC_AUTORESUME
-```
-
-看到你预期的几行就 OK。
-
-## 9. 添加自定义关键词
-
-内置关键词表覆盖了 Claude Code / Codex / 国内大模型通用中文三套。如果你用的模型打印出来的限额提示不在表里，可以在 `~/.cc-autoresume/triggers.json` 放一份 JSON 追加扩展：
+屏幕扫描仍用于 Codex、ccs 第三方 provider，以及只打印文本限额错误的模型。可以创建 `~/.cc-autoresume/triggers.json` 扩展内置关键词：
 
 ```json
 {
@@ -251,97 +270,53 @@ env | grep CC_AUTORESUME
 }
 ```
 
-各字段含义：
+用户 triggers 会追加到内置表上。无效正则会被跳过并写入日志。
 
-- `patterns` (`string[]`)：限额提示的正则源码。会用 `new RegExp(s)` 编译。
-- `errorContextHints` (`string[]`)：限额关键词命中后还要至少有一个错误上下文 hint 同时出现，才会触发暂停。防止把 Claude 在回答里解释 rate limit 概念的话误判成真错误。
-- `resetExtractors`：从提示里抽 reset 时间。三种类型：
-  - `{ "type": "absolute", "pattern": "..." }`：捕获组 1 是时间戳（`Date.parse` 能识别的格式，或 `HH:MM`）。
-  - `{ "type": "relative", "pattern": "...", "unit": "sec"|"min"|"hour" }`：捕获组 1 是数字。
-  - `{ "type": "compound", "pattern": "..." }`：捕获组 1 是数字，组 2 是单位（`秒`/`sec`/`分钟`/`min`/`小时`/`hour`/...）。
-- `busyMarkers` / `idleMarkers`：BUSY / IDLE 状态跟踪用的正则源码。
+## 13. 会话 ID 管理
 
-用户关键词是**附加**到内置表上的（不替换）。无效正则会被静默跳过并写入日志文件。
+`target=claude` 时，wrapper 会自动生成 UUID，并以 `--session-id <uuid>` 传给 Claude Code，除非用户已经传了 `--session-id`、`--resume`、`--continue`、`--fork-session` 或 `--from-pr` 这类 session 相关参数。
 
-## 10. 多终端并存与状态清理
-
-默认情况下，每个 wrapper 都写自己的状态文件：`~/.cc-autoresume/state-<pid>.json`。这样多个终端 tab 同时用 `cc-autoresume` 包 Claude / Codex 时，不会互相覆盖 `auto_resume`、`wake_at`、目标 CLI 或 PID。
-
-如果 wrapper 在暂停期间被打断（手动退出、电脑重启、进程崩溃），下次启动**不会自动接管旧 state 恢复等待**。虽然 state 文件里记录了 wrapper 给 claude 分配的 `session_id`（详见 [11. 会话 ID 管理](#11-会话-id-管理)），但自动给新 wrapper 续上旧会话可能续到用户已经放弃的对话——所以这一步留给用户主动决定：
+同一个 UUID 会保存到 `state-<pid>.json` 的 `session_id` 字段，方便手动恢复时精确找到会话：
 
 ```bash
-cat ~/.cc-autoresume/state-*.json | jq -r '.session_id'  # 查出要续的 session
-claude --resume <session-id>                              # 自己选要不要续
+cat ~/.cc-autoresume/state-*.json | jq -r '.session_id'
+claude --resume <session-id>
 ```
 
-每次启动还会顺手清理状态目录：凡是 `state-*.json` / 老格式 `state.json` 里记录的 PID 已死，且 `paused_at` 超过 `CC_AUTORESUME_RESTORE_MAX_AGE_HOURS` 的文件，都会被直接删除。PID 还活着的文件、PID 已死但还在最大等待时间内的文件、`log.jsonl`、`triggers.json` 都不会动。
-
-如果想手动清空所有暂停状态：
+关闭这个功能：
 
 ```bash
-rm ~/.cc-autoresume/state-*.json ~/.cc-autoresume/state.json 2>/dev/null
+CC_AUTORESUME_DISABLE_SESSION_TRACKING=1 cc-autoresume claude
 ```
 
-排查启动清理行为可以看日志：
+## 14. 休眠 / 唤醒
 
-```bash
-tail -f ~/.cc-autoresume/log.jsonl | jq 'select(.event == "state_swept")'
-```
+电脑休眠期间，Node 的单发 timer 可能因为 monotonic clock 冻结而延迟。`cc-autoresume` 在暂停期间会保留一个墙钟 heartbeat：每 60 秒比较一次 `Date.now()` 和 `wake_at`。如果电脑唤醒时已经超过额度重置时间，下一次 heartbeat 会立即恢复。
 
-## 11. 会话 ID 管理
+- 只在暂停期间运行。
+- 唤醒或 wrapper 退出后立即清除。
+- 休眠后的最坏恢复延迟约 60 秒。
+- 可用 `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT=1` 关闭。
 
-`target=claude` 时，wrapper 启动会**自动生成一个 UUID**，并以 `--session-id <uuid>` 的方式注入给 `claude` 子进程。`claude` 会按这个 UUID 在 `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` 创建会话文件。同一个 UUID 也被写进 `~/.cc-autoresume/state-<pid>.json` 的 `session_id` 字段。
+## 15. Claude 撞墙菜单自动选择
 
-这样能解决什么问题：
+Claude Code 撞墙后可能显示交互菜单。对 `claude` 和 `ccs claude`，`cc-autoresume` 默认会在检测到限额 500ms 后发送 `enter`，确认 Claude Code 默认选中的 `Stop and wait for limit to reset`。
 
-- **可追踪**：撞墙后 `cat state-*.json | jq .session_id` 直接看到当前会话对应哪个本地 jsonl，避免在 `claude /resume` picker 里找半天
-- **手动续会话精确无歧义**：`claude --resume <session_id>` 续的是 wrapper 实际管的那个会话，不依赖"最近一次"启发式（多 tab 并发场景下 `-c` 会续到错的）
-
-什么情况下 wrapper **不**会注入 `--session-id`（即"用户已经表达过 session 意图，wrapper 不插手"）：
-
-| 用户传的参数 | wrapper 行为 |
-|---|---|
-| `--session-id <id>` | 沿用此 ID 做 state 跟踪（语义一致，不重复注入） |
-| `-r <id>` / `--resume <id>`（带值） | 沿用此 ID 做 state 跟踪 |
-| `-r` / `--resume`（picker 模式，无值） | 不跟踪，`session_id` 字段留空 |
-| `-c` / `--continue` | 不跟踪，`session_id` 字段留空 |
-| `--fork-session` / `--from-pr ...` | 不跟踪 |
-| `target=codex` 等其它 CLI | 整个特性跳过 |
-
-完全关闭这个特性：`CC_AUTORESUME_DISABLE_SESSION_TRACKING=1`，wrapper 会回到不注入任何参数的旧行为。
-
-## 12. 休眠场景说明（合盖再开盖）
-
-Mac 合盖 / Windows 休眠期间，wrapper 与 `claude` 子进程都会被系统 `SIGSTOP`，进程 PID 还在、内存状态保留、PTY 不丢、本地 session 文件不受影响——所以**休眠对功能是安全的**。
-
-但有一个 Node.js 的坑：单发 `setTimeout` 底层用 monotonic 时钟，系统休眠时这个时钟会**暂停**。也就是说"撞墙时挂的 5h 定时器"在合盖 5h 后开盖时**并不会立刻 fire**，而是要等 wrapper "在线时间"补满 5h——可能导致唤醒晚数小时。
-
-wrapper 内置了一个**墙钟心跳兜底**来修这个：暂停期间每 60s 比较一次 `Date.now()` 和 `wake_at`，墙钟过了就立刻触发唤醒，并清掉所有定时器（幂等）。
-
-- **只在暂停期间运行**：撞墙后才创建，唤醒触发或 wrapper 退出后立即清掉，非暂停时段完全不跑
-- **开销可忽略**：每 60s 一次 `Date.now()` 比较，纳秒级
-- **唤醒最大延迟 60s**：合盖时间多长都没关系，开盖后下一次心跳触发就续上
-- 极端怕开销时可以 `CC_AUTORESUME_DISABLE_WAKE_HEARTBEAT=1` 关掉（仅在线场景下使用）
-
-## 13. 撞墙菜单自动选择
-
-Claude Code 撞墙时会弹一个交互菜单让用户选"暂停等待"或"升级套餐"。`CC_AUTORESUME_LIMIT_MENU_KEYS` 可以配置 wrapper 在识别到限额错误 500ms 后**盲发**给 `claude` 的方向键序列，自动帮你选"暂停等待"：
+只有当你的 Claude Code 版本默认高亮的不是等待选项时，才需要覆盖：
 
 ```bash
 export CC_AUTORESUME_LIMIT_MENU_KEYS="up,up,enter"
-# 或
-export CC_AUTORESUME_LIMIT_MENU_KEYS="enter"
+# 或用无效/no-op 值关闭内置默认行为
+export CC_AUTORESUME_LIMIT_MENU_KEYS="none"
 ```
 
-支持的键名：`up` / `down` / `left` / `right` / `enter` / `esc` / `tab` / `space`。逗号分隔，大小写不敏感，未知键名静默跳过。
+支持的键名：`up`、`down`、`left`、`right`、`enter`、`esc`、`tab`、`space`。
 
-默认值为空 = 不发送任何按键。等你撞一次真实限额、把菜单文本贴到 issue 后，我们会给你的 claude 版本推荐稳定的默认序列。
+## 16. 退出
 
-## 14. 退出与中断
+- 单次 `Ctrl+C` 会透传给被包装的 CLI。
+- 300ms 内连续两次 `Ctrl+C` 会强制结束 wrapper 和子进程。
 
-- 单次 `Ctrl+C`：被透传给目标 CLI（等价于在 CLI 里按 Ctrl+C）；
-- 300ms 内连续两次 `Ctrl+C`：强制结束 wrapper 与子 CLI。
-
-## 15. 许可证
+## 17. 许可证
 
 [MIT](./LICENSE)

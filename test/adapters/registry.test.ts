@@ -14,7 +14,9 @@ describe('selectAdapter', () => {
     expect(adapter.id).toBe('anthropic');
   });
 
-  it('非官方 ANTHROPIC_BASE_URL 下 auto 模式报错', () => {
-    expect(() => selectAdapter({ adapter: 'auto' }, { ANTHROPIC_BASE_URL: 'https://example.test' })).toThrow('无法自动识别');
+  it('非官方 ANTHROPIC_BASE_URL 下 auto 模式降级到 fallback', () => {
+    const adapter = selectAdapter({ adapter: 'auto' }, { ANTHROPIC_BASE_URL: 'https://example.test' });
+
+    expect(adapter.id).toBe('fallback');
   });
 });

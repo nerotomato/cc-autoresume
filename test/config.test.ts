@@ -7,13 +7,12 @@ describe('parseConfig', () => {
 
     expect(config.target).toBe('auto');
     expect(config.threshold).toBe(99);
-    expect(config.maxWaitHours).toBe(12);
     expect(config.balanceWarn).toBe(5);
     expect(config.resumeHint).toBe('继续');
     expect(config.adapter).toBe('auto');
-    // v0.2: API 轮询默认关闭，屏幕扫描为主
-    expect(config.disableApiPoll).toBe(true);
     expect(config.disableScreenScan).toBe(false);
+    expect(config.rateLimitsPollIntervalMs).toBe(10_000);
+    expect(config.rateLimitsMaxStalenessMs).toBe(120_000);
     expect(config.restoreMaxAgeHours).toBe(24);
     expect(config.statePath.endsWith(`.cc-autoresume/state-${process.pid}.json`)).toBe(true);
     expect(config.stateDir.endsWith('.cc-autoresume')).toBe(true);
@@ -52,23 +51,15 @@ describe('parseConfig', () => {
     expect(config.limitMenuKeys).toBe('up,enter');
   });
 
-  it('CC_AUTORESUME_ENABLE_API_POLL=1 时开启 API 轮询（opt-in）', () => {
-    const config = parseConfig([], { CC_AUTORESUME_ENABLE_API_POLL: '1' });
-    expect(config.disableApiPoll).toBe(false);
-  });
-
-  it('CC_AUTORESUME_DISABLE_API_POLL=1 保留向后兼容，显式关闭', () => {
-    const config = parseConfig([], { CC_AUTORESUME_DISABLE_API_POLL: '1' });
-    expect(config.disableApiPoll).toBe(true);
-  });
-
-  it('DISABLE 和 ENABLE 同时设置时 DISABLE 优先（保守）', () => {
+  it('可配置 rate-limits watcher 轮询间隔和过期时间', () => {
     const config = parseConfig([], {
-      CC_AUTORESUME_ENABLE_API_POLL: '1',
-      CC_AUTORESUME_DISABLE_API_POLL: '1',
+      CC_AUTORESUME_RATE_LIMITS_POLL_MS: '250',
+      CC_AUTORESUME_RATE_LIMITS_MAX_STALENESS_MS: '5000',
     });
-    expect(config.disableApiPoll).toBe(true);
+    expect(config.rateLimitsPollIntervalMs).toBe(250);
+    expect(config.rateLimitsMaxStalenessMs).toBe(5000);
   });
+
 
   it('解析 target 和透传参数', () => {
     const config = parseConfig(['--target=claude', '--', '--dangerously-skip-permissions'], {});
@@ -81,7 +72,6 @@ describe('parseConfig', () => {
     const config = parseConfig([], {
       CC_AUTORESUME_TARGET: 'codex',
       CC_AUTORESUME_THRESHOLD: '95',
-      CC_AUTORESUME_MAX_WAIT_HOURS: '6',
       CC_AUTORESUME_BALANCE_WARN: '10',
       CC_AUTORESUME_RESUME_HINT: '继续未完成的任务',
       CC_AUTORESUME_ADAPTER: 'mock',
@@ -92,7 +82,6 @@ describe('parseConfig', () => {
 
     expect(config.target).toBe('codex');
     expect(config.threshold).toBe(95);
-    expect(config.maxWaitHours).toBe(6);
     expect(config.balanceWarn).toBe(10);
     expect(config.resumeHint).toBe('继续未完成的任务');
     expect(config.adapter).toBe('mock');
@@ -105,6 +94,13 @@ describe('parseConfig', () => {
 
     expect(config.target).toBe('claude');
     expect(config.targetArgs).toEqual(['--allow-dangerously-skip-permissions', '--add-dir', '/tmp']);
+  });
+
+  it('支持位置参数形式指定 ccs target', () => {
+    const config = parseConfig(['ccs', 'codex', '--model', 'gpt-5.5'], {});
+
+    expect(config.target).toBe('ccs');
+    expect(config.targetArgs).toEqual(['codex', '--model', 'gpt-5.5']);
   });
 
   it('-- 分隔符仍然有效（用于完全显式透传，含 --target 字面量）', () => {

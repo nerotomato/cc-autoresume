@@ -1,8 +1,8 @@
 import type { SubscriptionUsageSnapshot } from './adapters/types';
 
-export type RuntimeStateName = 'idle' | 'running' | 'paused' | 'paused_long' | 'waking' | 'error';
+export type RuntimeStateName = 'idle' | 'running' | 'paused' | 'waking' | 'error';
 export type PauseTrigger = '5h' | '7d' | 'both' | 'screen' | 'manual' | null;
-export type WakeSource = 'text' | 'api' | 'default';
+export type WakeSource = 'text' | 'api' | 'statusline' | 'default';
 
 export interface ScreenWakeDecision {
   wakeAtMs: number;
@@ -67,10 +67,6 @@ export function decideWakeAt(
   };
 }
 
-export function classifyPause(wakeAtMs: number, nowMs: number, maxWaitHours: number): 'paused' | 'paused_long' {
-  const maxWaitMs = maxWaitHours * 60 * 60 * 1000;
-  return wakeAtMs - nowMs > maxWaitMs ? 'paused_long' : 'paused';
-}
 
 export function decideScreenWakeAt(
   extractedResetMs: number | undefined,

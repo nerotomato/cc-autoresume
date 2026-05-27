@@ -16,9 +16,6 @@ export function formatAutoWakeBanner(trigger: PauseTrigger, wakeAt: string): str
   return `[cc-autoresume] ${formatTrigger(trigger)} 已到上限，将于 ${formatLocalTimeSmart(wakeAt)} 自动唤醒`;
 }
 
-export function formatTooLongBanner(trigger: PauseTrigger, wakeAt: string, maxWaitHours: number): string {
-  return `[cc-autoresume] ${formatTrigger(trigger)} 已到上限，需等待至 ${formatLocalTimeSmart(wakeAt)}，超过自动唤醒上限 ${maxWaitHours}h。wrapper 将保持挂起，按 Ctrl+C 退出。`;
-}
 
 export function formatBalanceWarning(provider: string, balance: number, threshold: number, currency?: string): string {
   const unit = currency ? `${currency} ` : '';
@@ -34,7 +31,7 @@ export function formatVerifyPushed(nextWakeAt: string): string {
 }
 
 export function formatScreenPauseBanner(matchedPattern: string, wakeAt: string, source: WakeSource): string {
-  const sourceLabel = source === 'text' ? '来自提示文本' : source === 'api' ? '来自 API' : '默认 5h';
+  const sourceLabel = source === 'text' ? '来自提示文本' : source === 'api' ? '来自 API' : source === 'statusline' ? '来自 statusLine' : '默认 5h';
   return `[cc-autoresume] 屏幕检测到限额提示（/${matchedPattern}/），将于 ${formatLocalTimeSmart(wakeAt)} 自动唤醒（${sourceLabel}）`;
 }
 

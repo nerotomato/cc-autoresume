@@ -4,23 +4,27 @@ import type { Logger } from './logger';
 import { Scheduler, type SchedulerEvent } from './scheduler';
 import {
   formatAutoWakeBanner,
-  formatBalanceWarning,
-  formatIdlePauseBanner,
   formatScreenPauseBanner,
   formatScreenWakeSkipped,
-  formatTooLongBanner,
   formatVerifyPushed,
 } from './side-banner';
-import { sweepStaleStates, type PersistedState, type StateStore } from './state-store';
-import { classifyPause, decideScreenWakeAt } from './state-machine';
+import { isProcessAlive, sweepStaleStates, type PersistedState, type StateStore } from './state-store';
+import { decideScreenWakeAt, type WakeDecision } from './state-machine';
 import { createScreenScanner, type ScreenScanResult, type ScreenScanner } from './screen-scanner';
 import { loadTriggerSet } from './triggers';
 import type { TargetCommand } from './target';
 import { parseKeySequenceSteps, sendKeySequence, sendWakeSequence } from './wake-keys';
+import { RateLimitsWatcher } from './rate-limits-watcher';
+import {
+  clearStatusLineHint,
+  createStatusLineSpy,
+  sweepStaleStatusLineFiles,
+  writeStatusLineHint,
+  type StatusLineSpySetup,
+} from './statusline-spy';
 import { decideSession } from './session-id';
-import { getLatestKnownResetMs, isSubscriptionSnapshot, type UsageAdapter } from './adapters/types';
+import type { SubscriptionUsageSnapshot, UsageAdapter } from './adapters/types';
 
-const RECENT_BUSY_WINDOW_MS = 5000;
 
 export interface WrapperOptions {
   config: Config;
@@ -36,8 +40,10 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
   // Phase 4: 启动时清扫一遍——把"PID 死了 + paused_at 超过 max_age" 的 state 文件直接删，目录卫生
   const maxAgeMs = config.restoreMaxAgeHours * 60 * 60 * 1000;
   const sweptPaths = await sweepStaleStates(config.stateDir, maxAgeMs);
-  if (sweptPaths.length > 0) {
-    await logger.log('state_swept', { count: sweptPaths.length, paths: sweptPaths });
+  const sweptRuntimePaths = await sweepStaleStatusLineFiles(config.stateDir, isProcessAlive);
+  const sweptAllPaths = [...sweptPaths, ...sweptRuntimePaths];
+  if (sweptAllPaths.length > 0) {
+    await logger.log('state_swept', { count: sweptAllPaths.length, paths: sweptAllPaths });
   }
 
   // 仅 claude target 启用 session 跟踪：spawn 前算出 UUID + 注入参数
@@ -50,12 +56,27 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     await logger.log('session_decided', { source: decision.source, sessionId });
   }
 
+  const spySetup = shouldInjectStatusLineSpy(target)
+    ? await createStatusLineSpy({ stateDir: config.stateDir })
+    : undefined;
+  const targetEnv = spySetup
+    ? {
+        ...process.env,
+        CC_AUTORESUME_ORIGINAL_STATUSLINE: spySetup.originalStatusLineCommand ?? '',
+        CC_AUTORESUME_RATE_LIMITS_FILE: spySetup.rateLimitsFilePath,
+        CC_AUTORESUME_STATUSLINE_HINT_FILE: spySetup.statusLineHintFilePath,
+      }
+    : process.env;
+  if (spySetup) {
+    spawnArgs = injectSettingsArgs(target, spawnArgs, spySetup.settingsOverride);
+  }
+
   const child = pty.spawn(target.command, spawnArgs, {
     name: process.env.TERM || 'xterm-256color',
     cols: process.stdout.columns || 80,
     rows: process.stdout.rows || 24,
     cwd: process.cwd(),
-    env: process.env,
+    env: targetEnv,
   });
 
   await logger.log('wrapper_start', {
@@ -64,6 +85,10 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     pid: child.pid,
     adapter: adapter.id,
     sessionId,
+    statusLineSpy: Boolean(spySetup),
+    spyScriptPath: spySetup?.spyScriptPath,
+    rateLimitsFilePath: spySetup?.rateLimitsFilePath,
+    statusLineHintFilePath: spySetup?.statusLineHintFilePath,
   });
 
   let context!: SchedulerContext;
@@ -71,7 +96,7 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
   const scanner = config.disableScreenScan
     ? undefined
     : createScreenScanner({
-        triggerSet: loadTriggerSet(target.name, config.triggersFile, logger),
+        triggerSet: loadTriggerSet(triggerTargetFor(target), config.triggersFile, logger),
         onLimitHit: (result) => {
           void handleScreenLimitHit(result, context);
         },
@@ -81,18 +106,31 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     adapter,
     env: process.env,
     threshold: config.threshold,
-    maxWaitHours: config.maxWaitHours,
-    balanceWarn: config.balanceWarn,
-    wakeBufferMs: config.wakeBufferMs,
     defaultWaitMs: config.defaultWaitHours * 60 * 60 * 1000,
-    disablePolling: config.disableApiPoll,
+    disableWakeHeartbeat: config.disableWakeHeartbeat,
     onEvent: async (event) => {
       await handleSchedulerEvent(event, context);
     },
   });
 
+  const rateLimitsWatcher = spySetup && shouldWatchStatusLineRateLimits(target, process.env)
+    ? new RateLimitsWatcher({
+        filePath: spySetup.rateLimitsFilePath,
+        threshold: config.threshold,
+        pollIntervalMs: config.rateLimitsPollIntervalMs,
+        maxStalenessMs: config.rateLimitsMaxStalenessMs,
+        wakeBufferMs: config.wakeBufferMs,
+        onLimitHit: async (decision, snapshot) => {
+          await handleStatusLineLimitHit(decision, snapshot, context);
+        },
+        onError: async (error) => {
+          await logger.log('rate_limits_watcher_error', { error });
+        },
+      })
+    : undefined;
+
   context = {
-    config, target, adapter, stateStore, logger, child, scheduler, scanner,
+    config, target, adapter, stateStore, logger, child, scheduler, scanner, spySetup, rateLimitsWatcher,
     paused: false,
     sessionId,
   };
@@ -108,14 +146,18 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
       if (finished) return;
       finished = true;
       scheduler.stop();
+      rateLimitsWatcher?.stop();
       stdin.off('data', onInput);
       stdout.off('resize', onResize);
       process.off('SIGTERM', onSigterm);
       process.off('SIGINT', onSigint);
       if (stdin.isTTY) stdin.setRawMode(Boolean(wasRaw));
       stdin.pause();
-      void logger.log('wrapper_exit', { exitCode, pid: child.pid });
-      resolve(exitCode);
+      void (async () => {
+        await clearStatusLineHint(spySetup?.statusLineHintFilePath);
+        await spySetup?.cleanup();
+        await logger.log('wrapper_exit', { exitCode, pid: child.pid });
+      })().finally(() => resolve(exitCode));
     };
 
     const forceExit = () => {
@@ -167,6 +209,7 @@ export async function runWrapper(options: WrapperOptions): Promise<number> {
     process.on('SIGINT', onSigint);
 
     scheduler.start();
+    rateLimitsWatcher?.start();
   });
 }
 
@@ -179,43 +222,60 @@ interface SchedulerContext {
   child: pty.IPty;
   scheduler: Scheduler;
   scanner?: ScreenScanner;
+  spySetup?: StatusLineSpySetup;
+  rateLimitsWatcher?: RateLimitsWatcher;
   paused: boolean;
   sessionId?: string;
 }
 
-function isBusyOrRecentlyBusy(scanner: ScreenScanner | undefined): boolean {
-  if (!scanner) return true; // 没扫描器无法判断，保守认定 BUSY → 倾向自动恢复
-  const busy = scanner.getBusyState();
-  if (busy.state === 'BUSY') return true;
-  return Date.now() - busy.lastBusyAt <= RECENT_BUSY_WINDOW_MS;
-}
-
-async function handleScreenLimitHit(result: ScreenScanResult, context: SchedulerContext): Promise<void> {
-  const { config, target, adapter, stateStore, logger, child, scheduler, scanner } = context;
+async function handleStatusLineLimitHit(
+  decision: WakeDecision,
+  _snapshot: SubscriptionUsageSnapshot,
+  context: SchedulerContext,
+): Promise<void> {
+  const { config, target, adapter, stateStore, logger, child, scheduler, scanner, spySetup } = context;
   if (context.paused) return;
   context.paused = true;
   scanner?.pause();
 
-  // 屏幕触发时若 API 可用，调一次拿 reset 时间作兜底
-  let apiResetMs: number | undefined;
-  if (!config.disableApiPoll) {
-    try {
-      const snap = await adapter.fetch(process.env);
-      if (isSubscriptionSnapshot(snap)) apiResetMs = getLatestKnownResetMs(snap);
-    } catch {
-      // 忽略，走默认 5h 兜底
-    }
-  }
+  const wakeAt = new Date(decision.wakeAtMs).toISOString();
+  const state: PersistedState = {
+    version: 2,
+    state: 'paused',
+    trigger: decision.trigger,
+    target: target.name,
+    adapter_id: adapter.id,
+    paused_at: new Date().toISOString(),
+    resets_at: decision.resetsAt,
+    wake_at: wakeAt,
+    pid: child.pid,
+    auto_resume: true,
+    wake_source: 'statusline',
+    session_id: context.sessionId,
+  };
+  await stateStore.save(state);
+
+  if (spySetup) await writeStatusLineHint(spySetup.statusLineHintFilePath, wakeAt, decision.trigger);
+  printBanner(formatAutoWakeBanner(decision.trigger, wakeAt));
+  await logger.log('statusline_pause_due', { trigger: decision.trigger, wakeAt, sessionId: context.sessionId });
+
+  scheduler.pauseUntil(wakeAt, { skipVerify: true });
+}
+
+async function handleScreenLimitHit(result: ScreenScanResult, context: SchedulerContext): Promise<void> {
+  const { config, target, adapter, stateStore, logger, child, scheduler, scanner, spySetup } = context;
+  if (context.paused) return;
+  context.paused = true;
+  scanner?.pause();
 
   const defaultWaitMs = config.defaultWaitHours * 60 * 60 * 1000;
   const nowMs = Date.now();
-  const decision = decideScreenWakeAt(result.extractedResetMs, apiResetMs, defaultWaitMs, nowMs, config.wakeBufferMs);
+  const decision = decideScreenWakeAt(result.extractedResetMs, undefined, defaultWaitMs, nowMs, config.wakeBufferMs);
   const wakeAt = new Date(decision.wakeAtMs).toISOString();
-  const mode = classifyPause(decision.wakeAtMs, nowMs, config.maxWaitHours);
 
   const state: PersistedState = {
     version: 2,
-    state: mode,
+    state: 'paused',
     trigger: 'screen',
     target: target.name,
     adapter_id: adapter.id,
@@ -227,88 +287,47 @@ async function handleScreenLimitHit(result: ScreenScanResult, context: Scheduler
     session_id: context.sessionId,
   };
   await stateStore.save(state);
+  if (spySetup) await writeStatusLineHint(spySetup.statusLineHintFilePath, wakeAt, 'screen');
   printBanner(formatScreenPauseBanner(result.matchedPattern, wakeAt, decision.source));
-  await logger.log('screen_pause_due', { matched: result.matchedPattern, wakeAt, source: decision.source, mode, sessionId: context.sessionId });
+  await logger.log('screen_pause_due', { matched: result.matchedPattern, wakeAt, source: decision.source, sessionId: context.sessionId });
 
-  // 撞墙时如果用户配置了菜单按键序列，盲发让 claude 自动选"暂停等待"
-  // 等 500ms 让 claude 把菜单画完，再发键
-  if (target.name === 'claude' && config.limitMenuKeys && config.limitMenuKeys.length > 0) {
-    const steps = parseKeySequenceSteps(config.limitMenuKeys);
+  const menuKeys = resolveLimitMenuKeys(target, config.limitMenuKeys);
+  if (menuKeys) {
+    const steps = parseKeySequenceSteps(menuKeys);
     if (steps.length > 0) {
       setTimeout(() => {
-        void sendKeySequence(child, steps).then(() => logger.log('menu_keys_sent', { keys: config.limitMenuKeys }));
+        void sendKeySequence(child, steps).then(() => logger.log('menu_keys_sent', { keys: menuKeys }));
       }, 500);
     }
   }
 
-  if (mode === 'paused') scheduler.pauseUntil(wakeAt, { skipVerify: true });
+  scheduler.pauseUntil(wakeAt, { skipVerify: true });
 }
 
 async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerContext): Promise<void> {
-  const { config, target, adapter, stateStore, logger, child, scheduler, scanner } = context;
-
-  if (event.type === 'snapshot') {
-    await logger.log('snapshot', { kind: event.snapshot.kind, adapter: adapter.id });
-    return;
-  }
-
-  if (event.type === 'balance-warning') {
-    printBanner(formatBalanceWarning(event.snapshot.provider, event.snapshot.balance, config.balanceWarn, event.snapshot.currency));
-    await logger.log('balance_warning', { provider: event.snapshot.provider, balance: event.snapshot.balance, currency: event.snapshot.currency });
-    return;
-  }
-
-  if (event.type === 'pause-due') {
-    if (context.paused) return;
-    context.paused = true;
-    scanner?.pause();
-
-    const autoResume = isBusyOrRecentlyBusy(scanner);
-    const state: PersistedState = {
-      version: 2,
-      state: event.mode,
-      trigger: event.trigger,
-      target: target.name,
-      adapter_id: adapter.id,
-      paused_at: new Date().toISOString(),
-      resets_at: event.resetsAt,
-      wake_at: event.wakeAt,
-      pid: child.pid,
-      auto_resume: autoResume,
-      wake_source: 'api',
-      session_id: context.sessionId,
-    };
-    await stateStore.save(state);
-
-    const banner = !autoResume
-      ? formatIdlePauseBanner(event.trigger, event.wakeAt)
-      : event.mode === 'paused'
-        ? formatAutoWakeBanner(event.trigger, event.wakeAt)
-        : formatTooLongBanner(event.trigger, event.wakeAt, config.maxWaitHours);
-    printBanner(banner);
-    await logger.log('pause_due', { mode: event.mode, trigger: event.trigger, wakeAt: event.wakeAt, auto_resume: autoResume });
-    return;
-  }
+  const { config, target, stateStore, logger, child, scheduler, scanner, spySetup, rateLimitsWatcher } = context;
 
   if (event.type === 'wake-due') {
     const persisted = await stateStore.load();
 
-    // 用户在暂停期间已经自己回来用了，跳过注入避免污染上下文
     if (scanner && scanner.getBusyState().state === 'BUSY') {
       printBanner(formatScreenWakeSkipped());
       await stateStore.clear();
+      await clearStatusLineHint(spySetup?.statusLineHintFilePath);
       context.paused = false;
       scanner.resume();
+      rateLimitsWatcher?.reset();
       await logger.log('wake_skipped_user_active', { target: target.name });
       scheduler.resumePolling();
       return;
     }
 
-    // 之前的暂停被标为不自动恢复（IDLE 时被 API 路径暂停，或预留的 manual）
     if (persisted && persisted.auto_resume === false) {
       await stateStore.clear();
+      await clearStatusLineHint(spySetup?.statusLineHintFilePath);
       context.paused = false;
       scanner?.resume();
+      rateLimitsWatcher?.reset();
       await logger.log('wake_skipped_no_resume', { target: target.name });
       scheduler.resumePolling();
       return;
@@ -319,7 +338,7 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
       state: 'waking',
       trigger: null,
       target: target.name,
-      adapter_id: adapter.id,
+      adapter_id: context.adapter.id,
       wake_at: new Date().toISOString(),
       pid: child.pid,
       auto_resume: true,
@@ -327,8 +346,10 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
     });
     await sendWakeSequence(child, { target: target.name, resumeHint: config.resumeHint });
     await stateStore.clear();
+    await clearStatusLineHint(spySetup?.statusLineHintFilePath);
     context.paused = false;
     scanner?.resume();
+    rateLimitsWatcher?.reset();
     await logger.log('wake_sent', { target: target.name });
     scheduler.resumePolling();
     return;
@@ -339,6 +360,7 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
     const current = await stateStore.load();
     if (current) {
       await stateStore.save({ ...current, wake_at: event.nextWakeAt });
+      if (spySetup && current.trigger) await writeStatusLineHint(spySetup.statusLineHintFilePath, event.nextWakeAt, current.trigger);
     }
     await logger.log('verify_pushed', { attempt: event.attempt, nextWakeAt: event.nextWakeAt, error: event.error });
     return;
@@ -347,6 +369,37 @@ async function handleSchedulerEvent(event: SchedulerEvent, context: SchedulerCon
   if (event.type === 'error') {
     await logger.log('scheduler_error', { error: event.error });
   }
+}
+
+function shouldInjectStatusLineSpy(target: TargetCommand): boolean {
+  return target.name === 'claude' || target.name === 'ccs';
+}
+
+function shouldWatchStatusLineRateLimits(target: TargetCommand, env: NodeJS.ProcessEnv): boolean {
+  if (target.name === 'ccs') return (target.args[0] ?? '').toLowerCase() === 'claude';
+  if (target.name !== 'claude') return false;
+  const baseUrl = (env.ANTHROPIC_BASE_URL ?? '').toLowerCase();
+  return !baseUrl || baseUrl.includes('api.anthropic.com');
+}
+
+function resolveLimitMenuKeys(target: TargetCommand, configuredKeys: string): string | undefined {
+  if (configuredKeys.length > 0) return configuredKeys;
+  if (target.name === 'claude') return 'enter';
+  if (target.name === 'ccs' && (target.args[0] ?? '').toLowerCase() === 'claude') return 'enter';
+  return undefined;
+}
+
+function injectSettingsArgs(target: TargetCommand, args: string[], settingsOverride: string): string[] {
+  if (target.name === 'ccs' && args.length > 0 && !args[0].startsWith('-')) {
+    return [args[0], '--settings', settingsOverride, ...args.slice(1)];
+  }
+  return ['--settings', settingsOverride, ...args];
+}
+
+function triggerTargetFor(target: TargetCommand): 'claude' | 'codex' {
+  if (target.name === 'codex') return 'codex';
+  if (target.name === 'ccs' && (target.args[0] ?? '').toLowerCase() === 'codex') return 'codex';
+  return 'claude';
 }
 
 function printBanner(message: string): void {

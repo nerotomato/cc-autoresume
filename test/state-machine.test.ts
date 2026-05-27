@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyPause, decideScreenWakeAt, decideWakeAt, shouldWakeAfterVerify } from '../src/state-machine';
+import { decideScreenWakeAt, decideWakeAt, shouldWakeAfterVerify } from '../src/state-machine';
 import type { SubscriptionUsageSnapshot } from '../src/adapters/types';
 
 const base: SubscriptionUsageSnapshot = {
@@ -46,12 +46,6 @@ describe('state-machine', () => {
     expect(decision).toBeNull();
   });
 
-  it('按最大等待时间区分 paused 和 paused_long', () => {
-    const now = Date.parse('2026-05-20T00:00:00.000Z');
-
-    expect(classifyPause(now + 2 * 60 * 60 * 1000, now, 12)).toBe('paused');
-    expect(classifyPause(now + 13 * 60 * 60 * 1000, now, 12)).toBe('paused_long');
-  });
 
   it('verify 需要低于 threshold - 10', () => {
     expect(shouldWakeAfterVerify({ ...base, five_hour: { utilization: 88 } }, 99)).toBe(true);

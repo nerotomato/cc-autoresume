@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatAutoWakeBanner, formatBalanceWarning, formatLocalTimeSmart, formatTooLongBanner } from '../src/side-banner';
+import { formatAutoWakeBanner, formatBalanceWarning, formatLocalTimeSmart } from '../src/side-banner';
 
 describe('side-banner', () => {
   it('同日只显示时间', () => {
@@ -22,11 +22,6 @@ describe('side-banner', () => {
     expect(formatAutoWakeBanner('5h', target)).toContain('5h 已到上限');
   });
 
-  it('生成等不起提示', () => {
-    const target = new Date(2026, 4, 27, 14, 32, 0).toISOString();
-
-    expect(formatTooLongBanner('7d', target, 12)).toContain('超过自动唤醒上限 12h');
-  });
 
   it('生成余额预警提示', () => {
     expect(formatBalanceWarning('DeepSeek', 1.23, 5, 'CNY')).toContain('DeepSeek 余额 CNY 1.23 低于阈值 CNY 5');
