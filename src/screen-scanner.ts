@@ -23,6 +23,10 @@ export interface ScreenScannerOptions {
   recentBusyMs?: number;
 }
 
+// CSI 序列剥离。会同时吃掉 \x1b[?25l/h 这类逻辑标志，
+// 所以 busy/idle marker 检查必须跑在原 chunk 上，不能用剥离后的内容
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
 export interface ScreenScanner {
   feed(chunk: string): void;
   getBusyState(): BusyState;
@@ -47,6 +51,7 @@ export function createScreenScanner(options: ScreenScannerOptions): ScreenScanne
   function feed(chunk: string): void {
     if (paused || chunk.length === 0) return;
 
+    // busy/idle marker 必须用原 chunk——\x1b[?25l 这类标志依赖 ANSI 残留
     if (options.triggerSet.busyMarkers.some((m) => m.test(chunk))) {
       busyState = 'BUSY';
       lastBusyAt = now();
@@ -55,7 +60,8 @@ export function createScreenScanner(options: ScreenScannerOptions): ScreenScanne
       busyState = 'IDLE';
     }
 
-    buffer += chunk;
+    // 剥离 ANSI 后再进 buffer，限额 pattern 不会被字间颜色码切断
+    buffer += chunk.replace(ANSI_RE, '');
     if (buffer.length > bufferSize) buffer = buffer.slice(buffer.length - bufferSize);
 
     const t = now();

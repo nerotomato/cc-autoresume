@@ -131,6 +131,31 @@ describe('ScreenScanner.feed', () => {
     expect(resetDate.getUTCMinutes()).toBe(46);
   });
 
+  it('能匹配被 ANSI 颜色码包裹的错误文本（红色错误消息）', () => {
+    const hits: ScreenScanResult[] = [];
+    const scanner = makeScanner(() => 0, (r) => hits.push(r));
+
+    setBusy(scanner);
+    // 模拟带 ANSI 颜色码的真实 PTY 输出
+    scanner.feed(
+      '\x1b[31mAPI Error: Request rejected (429) · You have exceeded the 5-hour usage quota.\x1b[0m\n',
+    );
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0].trigger).toBe('screen');
+  });
+
+  it('ANSI 颜色码插在关键词之间也能命中（buffer 已剥离 ANSI）', () => {
+    const hits: ScreenScanResult[] = [];
+    const scanner = makeScanner(() => 0, (r) => hits.push(r));
+
+    setBusy(scanner);
+    // 极端情况：颜色码切在 "rate" 和 "_limit_error" 之间
+    scanner.feed('Error: rate\x1b[0m_limit_error 5-hour limit reached\n');
+
+    expect(hits).toHaveLength(1);
+  });
+
   it('BUSY 超过 recentBusyMs 后进入 IDLE 不触发', () => {
     const hits: ScreenScanResult[] = [];
     let t = 100_000;

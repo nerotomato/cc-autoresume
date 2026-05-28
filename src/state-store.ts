@@ -86,8 +86,9 @@ export async function listStateCandidates(dir: string): Promise<StateCandidate[]
   return candidates;
 }
 
-// 启动时清理：把 PID 不存活且 paused_at 超过 maxAgeMs 的 state 文件直接删掉
-// 返回删了多少个，主要给日志和测试用
+// 启动时清理。判定改为 dead || tooOld：
+// - PID 已死：立即清，与 sweepStaleStatusLineFiles 行为对齐（dead PID 的 state 对活进程没用）
+// - PID 活着但 paused_at 超过 maxAgeMs：兜底护栏，理论不该走到
 export async function sweepStaleStates(
   dir: string,
   maxAgeMs: number,
@@ -98,10 +99,13 @@ export async function sweepStaleStates(
   const swept: string[] = [];
 
   for (const { state, filePath } of candidates) {
-    if (processAlive(state.pid)) continue;
-    if (!state.paused_at) continue; // 没 paused_at 不好判断年龄，保守不删
-    const ageMs = nowMs - new Date(state.paused_at).getTime();
-    if (!Number.isFinite(ageMs) || ageMs <= maxAgeMs) continue;
+    const dead = !processAlive(state.pid);
+    let tooOld = false;
+    if (state.paused_at) {
+      const ageMs = nowMs - new Date(state.paused_at).getTime();
+      tooOld = Number.isFinite(ageMs) && ageMs > maxAgeMs;
+    }
+    if (!dead && !tooOld) continue;
     try {
       await fs.unlink(filePath);
       swept.push(filePath);

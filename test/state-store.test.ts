@@ -122,23 +122,47 @@ describe('listStateCandidates', () => {
 });
 
 describe('sweepStaleStates', () => {
-  it('删除 PID 已死且超过 maxAge 的 state 文件', async () => {
+  it('PID 已死立即清，不再等 maxAge；活进程 + 年轻 state 保留', async () => {
     const dir = await tempStateDir();
+    // 100：dead + 远超 maxAge → 收
+    // 200：alive + 年轻 → 保留（活进程的最新 state 必须留）
+    // 300：dead + 远小于 maxAge → 立即收（核心改动）
+    // 400：dead + 无 paused_at → 也收（PID 已死即可清，不再要求 paused_at）
+    // 500：alive + 无 paused_at → 保留
     await new StateStore(path.join(dir, 'state-100.json')).save(state({ pid: 100, paused_at: '2026-05-19T00:00:00.000Z' }));
-    await new StateStore(path.join(dir, 'state-200.json')).save(state({ pid: 200, paused_at: '2026-05-19T00:00:00.000Z' }));
+    await new StateStore(path.join(dir, 'state-200.json')).save(state({ pid: 200, paused_at: '2026-05-21T11:00:00.000Z' }));
     await new StateStore(path.join(dir, 'state-300.json')).save(state({ pid: 300, paused_at: '2026-05-21T11:00:00.000Z' }));
     await new StateStore(path.join(dir, 'state-400.json')).save(state({ pid: 400, paused_at: undefined }));
+    await new StateStore(path.join(dir, 'state-500.json')).save(state({ pid: 500, paused_at: undefined }));
 
     const swept = await sweepStaleStates(
       dir,
       24 * 60 * 60 * 1000,
       Date.parse('2026-05-21T12:00:00.000Z'),
-      (pid) => pid === 200,
+      (pid) => pid === 200 || pid === 500,
     );
 
-    expect(swept.map((filePath) => path.basename(filePath))).toEqual(['state-100.json']);
+    expect(swept.map((filePath) => path.basename(filePath)).sort()).toEqual([
+      'state-100.json',
+      'state-300.json',
+      'state-400.json',
+    ]);
     const remaining = await listStateCandidates(dir);
-    expect(remaining.map((c) => path.basename(c.filePath)).sort()).toEqual(['state-200.json', 'state-300.json', 'state-400.json']);
+    expect(remaining.map((c) => path.basename(c.filePath)).sort()).toEqual(['state-200.json', 'state-500.json']);
+  });
+
+  it('活进程 + paused_at 超过 maxAge 兜底清理', async () => {
+    const dir = await tempStateDir();
+    await new StateStore(path.join(dir, 'state-700.json')).save(state({ pid: 700, paused_at: '2026-05-19T00:00:00.000Z' }));
+
+    const swept = await sweepStaleStates(
+      dir,
+      24 * 60 * 60 * 1000,
+      Date.parse('2026-05-21T12:00:00.000Z'),
+      () => true,
+    );
+
+    expect(swept.map((filePath) => path.basename(filePath))).toEqual(['state-700.json']);
   });
 });
 
